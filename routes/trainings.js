@@ -126,18 +126,18 @@ router.get('/:id', async (req, res, next) => {
       SELECT 
         ar.id,
         ar.status,
-        ar.minutes_present,
+        ar.minutes_participated as minutes_present,
         ar.notes,
-        p.id as player_id,
-        p.jersey_number,
+        u.id as player_id,
+        tm.jersey_number,
         u.first_name,
         u.last_name,
         u.avatar_url
-      FROM attendance_records ar
-      JOIN players p ON ar.player_id = p.id
-      JOIN users u ON p.user_id = u.id
-      WHERE ar.training_session_id = ?
-      ORDER BY p.jersey_number
+      FROM attendance ar
+      JOIN users u ON ar.user_id = u.id
+      LEFT JOIN team_memberships tm ON ar.user_id = tm.user_id
+      WHERE ar.training_id = ?
+      ORDER BY tm.jersey_number
     `, [req.params.id]);
     
     res.json({

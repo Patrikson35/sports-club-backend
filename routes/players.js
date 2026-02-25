@@ -23,7 +23,7 @@ router.get('/', async (req, res, next) => {
         t.id as team_id,
         t.name as team_name,
         t.age_group
-      FROM players p
+      FROM team_memberships p
       JOIN users u ON p.user_id = u.id
       LEFT JOIN teams t ON p.team_id = t.id
       WHERE p.is_active = TRUE
@@ -84,7 +84,7 @@ router.get('/:id', async (req, res, next) => {
         u.avatar_url,
         t.name as team_name,
         t.age_group
-      FROM players p
+      FROM team_memberships p
       JOIN users u ON p.user_id = u.id
       LEFT JOIN teams t ON p.team_id = t.id
       WHERE p.id = ?
@@ -103,17 +103,17 @@ router.get('/:id', async (req, res, next) => {
         COUNT(CASE WHEN me.event_type = 'goal' THEN 1 END) as goals,
         COUNT(CASE WHEN me.event_type = 'yellow_card' THEN 1 END) as yellow_cards,
         COUNT(CASE WHEN me.event_type = 'red_card' THEN 1 END) as red_cards
-      FROM match_lineups ml
-      LEFT JOIN match_events me ON ml.player_id = me.player_id
-      WHERE ml.player_id = ?
+      FROM match_lineup ml
+      LEFT JOIN match_events me ON ml.user_id = me.user_id
+      WHERE ml.user_id = (SELECT user_id FROM team_memberships WHERE id = ?)
     `, [req.params.id]);
     
     const [attendance] = await db.query(`
       SELECT 
         COUNT(*) as total_trainings,
         SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) as attended
-      FROM attendance_records
-      WHERE player_id = ?
+      FROM attendance
+      WHERE user_id = (SELECT user_id FROM team_memberships WHERE id = ?)
     `, [req.params.id]);
     
     res.json({

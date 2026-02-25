@@ -8,15 +8,15 @@ router.get('/:trainingId', async (req, res, next) => {
     const [attendance] = await db.query(`
       SELECT 
         ar.*,
-        p.id as player_id,
+        u.id as player_id,
         p.jersey_number,
         u.first_name,
         u.last_name,
         u.avatar_url
-      FROM attendance_records ar
-      JOIN players p ON ar.player_id = p.id
-      JOIN users u ON p.user_id = u.id
-      WHERE ar.training_session_id = ?
+      FROM attendance ar
+      JOIN users u ON ar.user_id = u.id
+      LEFT JOIN team_memberships p ON ar.user_id = p.user_id
+      WHERE ar.training_id = ?
       ORDER BY p.jersey_number
     `, [req.params.trainingId]);
     
@@ -50,14 +50,14 @@ router.post('/', async (req, res, next) => {
     
     // Check if record exists
     const [existing] = await db.query(
-      'SELECT id FROM attendance_records WHERE training_session_id = ? AND player_id = ? AND date = ?',
-      [trainingSessionId, playerId, date || new Date()]
+      'SELECT id FROM attendance WHERE training_id = ? AND user_id = ?',
+      [trainingSessionId, playerId]
     );
     
     if (existing.length > 0) {
       // Update existing
       await db.query(
-        'UPDATE attendance_records SET status = ?, minutes_present = ?, notes = ? WHERE id = ?',
+        'UPDATE attendance SET status = ?, minutes_participated = ?, notes = ? WHERE id = ?',
         [status, minutesPresent || 0, notes, existing[0].id]
       );
       
@@ -68,8 +68,8 @@ router.post('/', async (req, res, next) => {
     } else {
       // Create new
       const [result] = await db.query(
-        'INSERT INTO attendance_records (training_session_id, player_id, status, minutes_present, notes, date) VALUES (?, ?, ?, ?, ?, ?)',
-        [trainingSessionId, playerId, status, minutesPresent || 0, notes, date || new Date()]
+        'INSERT INTO attendance (training_id, user_id, status, minutes_participated, notes) VALUES (?, ?, ?, ?, ?)',
+        [trainingSessionId, playerId, status, minutesPresent || 0, notes]
       );
       
       res.status(201).json({
@@ -90,13 +90,13 @@ router.get('/player/:playerId', async (req, res, next) => {
     const [attendance] = await db.query(`
       SELECT 
         ar.*,
-        ts.name as training_name,
+        ts.title as training_name,
         ts.date as training_date,
         ts.location
-      FROM attendance_records ar
-      JOIN training_sessions ts ON ar.training_session_id = ts.id
-      WHERE ar.player_id = ?
-      ORDER BY ar.date DESC
+      FROM attendance ar
+      JOIN training_sessions ts ON ar.training_id = ts.id
+      WHERE ar.user_id = ?
+      ORDER BY ts.date DESC
       LIMIT ?
     `, [req.params.playerId, parseInt(limit)]);
     
@@ -119,11 +119,11 @@ router.get('/player/:playerId', async (req, res, next) => {
       records: attendance.map(a => ({
         id: a.id,
         status: a.status,
-        minutesPresent: a.minutes_present,
+        minutesPresent: a.minutes_participated,
         notes: a.notes,
-        date: a.date,
+        date: a.recorded_at,
         training: {
-          id: a.training_session_id,
+          id: a.training_id,
           name: a.training_name,
           date: a.training_date,
           location: a.location

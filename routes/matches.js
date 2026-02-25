@@ -109,21 +109,21 @@ router.get('/:id/lineup', async (req, res, next) => {
     const [lineup] = await db.query(`
       SELECT 
         ml.*,
-        p.id as player_id,
-        p.jersey_number,
+        u.id as player_id,
+        tm.jersey_number,
         u.first_name,
         u.last_name,
         u.avatar_url
-      FROM match_lineups ml
-      JOIN players p ON ml.player_id = p.id
-      JOIN users u ON p.user_id = u.id
+      FROM match_lineup ml
+      JOIN users u ON ml.user_id = u.id
+      LEFT JOIN team_memberships tm ON ml.user_id = tm.user_id
       WHERE ml.match_id = ?
-      ORDER BY ml.is_starter DESC, p.jersey_number
+      ORDER BY ml.lineup_type, tm.jersey_number
     `, [req.params.id]);
     
     res.json({
       total: lineup.length,
-      starting: lineup.filter(l => l.is_starter).map(l => ({
+      starting: lineup.filter(l => l.lineup_type === 'starting').map(l => ({
         id: l.id,
         position: l.position,
         jerseyNumber: l.jersey_number,
@@ -136,7 +136,7 @@ router.get('/:id/lineup', async (req, res, next) => {
           avatar: l.avatar_url
         }
       })),
-      substitutes: lineup.filter(l => !l.is_starter).map(l => ({
+      substitutes: lineup.filter(l => l.lineup_type === 'substitute').map(l => ({
         id: l.id,
         position: l.position,
         jerseyNumber: l.jersey_number,
@@ -161,13 +161,13 @@ router.get('/:id/events', async (req, res, next) => {
     const [events] = await db.query(`
       SELECT 
         me.*,
-        p.jersey_number,
+        tm.jersey_number,
         u.first_name,
         u.last_name,
         u.avatar_url
       FROM match_events me
-      JOIN players p ON me.player_id = p.id
-      JOIN users u ON p.user_id = u.id
+      JOIN users u ON me.user_id = u.id
+      LEFT JOIN team_memberships tm ON me.user_id = tm.user_id
       WHERE me.match_id = ?
       ORDER BY me.minute
     `, [req.params.id]);

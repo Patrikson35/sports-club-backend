@@ -45,21 +45,21 @@ router.get('/results', async (req, res, next) => {
         tc.name as test_name,
         tc.category_type,
         tc.unit,
-        p.jersey_number,
+        tm.jersey_number,
         u.first_name,
         u.last_name,
         u.avatar_url
       FROM test_results tr
       JOIN test_categories tc ON tr.test_category_id = tc.id
-      JOIN players p ON tr.player_id = p.id
-      JOIN users u ON p.user_id = u.id
+      JOIN users u ON tr.user_id = u.id
+      LEFT JOIN team_memberships tm ON tr.user_id = tm.user_id
       WHERE 1=1
     `;
     
     const params = [];
     
     if (playerId) {
-      query += ' AND tr.player_id = ?';
+      query += ' AND tr.user_id = ?';
       params.push(playerId);
     }
     
@@ -168,36 +168,36 @@ router.get('/stats/:categoryType', async (req, res, next) => {
     
     let query = `
       SELECT 
-        p.id as player_id,
-        p.jersey_number,
+        u.id as player_id,
+        tm.jersey_number,
         u.first_name,
         u.last_name,
         u.avatar_url,
         tc.id as test_id,
         tc.name as test_name,
         tc.unit,
-        tr.value,
-        tr.test_date
-      FROM players p
-      JOIN users u ON p.user_id = u.id
+        tr.result_value as value,
+        tr.recorded_at as test_date
+      FROM team_memberships tm
+      JOIN users u ON tm.user_id = u.id
       CROSS JOIN test_categories tc
-      LEFT JOIN test_results tr ON p.id = tr.player_id AND tc.id = tr.test_category_id
-        AND tr.test_date = (
-          SELECT MAX(test_date) 
+      LEFT JOIN test_results tr ON u.id = tr.user_id AND tc.id = tr.test_category_id
+        AND tr.recorded_at = (
+          SELECT MAX(recorded_at) 
           FROM test_results 
-          WHERE player_id = p.id AND test_category_id = tc.id
+          WHERE user_id = u.id AND test_category_id = tc.id
         )
-      WHERE tc.category_type = ? AND p.is_active = TRUE
+      WHERE tc.category_type = ? AND tm.is_active = TRUE
     `;
     
     const params = [req.params.categoryType];
     
     if (teamId) {
-      query += ' AND p.team_id = ?';
+      query += ' AND tm.team_id = ?';
       params.push(teamId);
     }
     
-    query += ' ORDER BY p.jersey_number, tc.name';
+    query += ' ORDER BY tm.jersey_number, tc.name';
     
     const [stats] = await db.query(query, params);
     

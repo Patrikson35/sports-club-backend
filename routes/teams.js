@@ -12,7 +12,7 @@ router.get('/', async (req, res, next) => {
         COUNT(DISTINCT p.id) as player_count
       FROM teams t
       LEFT JOIN clubs c ON t.club_id = c.id
-      LEFT JOIN players p ON t.id = p.team_id AND p.is_active = TRUE
+      LEFT JOIN team_memberships p ON t.id = p.team_id AND p.is_active = TRUE
       GROUP BY t.id
       ORDER BY t.age_group
     `);
@@ -61,7 +61,7 @@ router.get('/:id', async (req, res, next) => {
         u.first_name,
         u.last_name,
         u.avatar_url
-      FROM players p
+      FROM team_memberships p
       JOIN users u ON p.user_id = u.id
       WHERE p.team_id = ? AND p.is_active = TRUE
       ORDER BY p.jersey_number
@@ -104,7 +104,7 @@ router.get('/:id/players', async (req, res, next) => {
         u.email,
         u.date_of_birth,
         u.avatar_url
-      FROM players p
+      FROM team_memberships p
       JOIN users u ON p.user_id = u.id
       WHERE p.team_id = ? AND p.is_active = TRUE
       ORDER BY p.jersey_number
