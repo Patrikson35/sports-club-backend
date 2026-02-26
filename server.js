@@ -7,6 +7,7 @@ const errorHandler = require('./middleware/errorHandler');
 const authRoutes = require('./routes/auth');
 const playersRoutes = require('./routes/players');
 const teamsRoutes = require('./routes/teams');
+const clubsRoutes = require('./routes/clubs');
 const trainingsRoutes = require('./routes/trainings');
 const exercisesRoutes = require('./routes/exercises');
 const matchesRoutes = require('./routes/matches');
@@ -41,6 +42,7 @@ app.get('/health', (req, res) => {
 
 // API Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/clubs', clubsRoutes);
 app.use('/api/players', playersRoutes);
 app.use('/api/teams', teamsRoutes);
 app.use('/api/trainings', trainingsRoutes);
