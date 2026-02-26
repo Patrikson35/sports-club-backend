@@ -104,10 +104,17 @@ router.post('/register', [
 
     // Determine role based on registrationType
     let role = 'player';
-    if (registrationType === 'club') role = 'club';
-    else if (registrationType === 'coach') role = 'coach';
-    else if (registrationType === 'parent') role = 'parent';
-    else role = 'player'; // default
+    if (registrationType === 'club') {
+      role = 'club';
+    } else if (registrationType === 'club_coach') {
+      role = 'coach'; // Klubový tréner má rolu 'coach'
+    } else if (registrationType === 'private_coach') {
+      role = 'private_coach';
+    } else if (registrationType === 'player') {
+      role = 'player';
+    } else {
+      role = 'player'; // default
+    }
 
     // Insert user (is_verified = FALSE = waiting for email verification)
     const [userResult] = await db.query(
