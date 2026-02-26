@@ -3,7 +3,9 @@ const router = express.Router();
 const db = require('../config/database');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
+const { sendVerificationEmail } = require('../services/email');
 
 // POST /api/auth/login - User login
 router.post('/login', [
@@ -71,8 +73,7 @@ router.post('/register', [
   body('email').isEmail().normalizeEmail(),
   body('password').isLength({ min: 6 }),
   body('firstName').notEmpty().trim(),
-  body('lastName').notEmpty().trim(),
-  body('registerAs').isIn(['club', 'trainer', 'player']).withMessage('Invalid registration type')
+  body('lastName').notEmpty().trim()
 ], async (req, res, next) => {
   try {
     const errors = validationResult(req);
@@ -81,12 +82,14 @@ router.post('/register', [
     }
 
     const { 
-      email, password, firstName, lastName, registerAs,
-      // Club data
+      email, password, firstName, lastName, 
+      registrationType, // 'player', 'coach', 'club', 'parent'
+      sport,
+      // Club data (optional)
       clubName, address, city, country, logo,
-      // Trainer data
+      // Trainer data (optional)
       clubId, isClubTrainer, isPersonalTrainer,
-      // Player data
+      // Player data (optional)
       dateOfBirth, position, preferredFoot
     } = req.body;
 
@@ -99,12 +102,14 @@ router.post('/register', [
     // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Determine role based on registerAs
+    // Determine role based on registrationType
     let role = 'player';
-    if (registerAs === 'club') role = 'club';
-    else if (registerAs === 'trainer') role = 'coach';
+    if (registrationType === 'club') role = 'club';
+    else if (registrationType === 'coach') role = 'coach';
+    else if (registrationType === 'parent') role = 'parent';
+    else role = 'player'; // default
 
-    // Insert user (is_verified = FALSE = čaká na schválenie)
+    // Insert user (is_verified = FALSE = waiting for email verification)
     const [userResult] = await db.query(
       `INSERT INTO users (email, password_hash, first_name, last_name, role, date_of_birth, is_active, is_verified) 
        VALUES (?, ?, ?, ?, ?, ?, TRUE, FALSE)`,
@@ -114,7 +119,7 @@ router.post('/register', [
     const userId = userResult.insertId;
 
     // Handle specific registration types
-    if (registerAs === 'club') {
+    if (registrationType === 'club') {
       // Create club
       if (!clubName) {
         return res.status(400).json({ error: 'Meno klubu je povinné' });
@@ -126,18 +131,38 @@ router.post('/register', [
         [clubName, address || null, city || null, country || 'SK', userId, email]
       );
     } 
-    else if (registerAs === 'trainer') {
+    else if (registrationType === 'coach') {
       // Trainer registration - optionally associate with club
       // TODO: Add trainer-specific data if needed
       // For now, just create user with coach role
     } 
-    else if (registerAs === 'player') {
+    else if (registrationType === 'player') {
       // Player registration - will be added to team after approval
       // Store position in user record or wait for team assignment
     }
 
+    // Create email verification token
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date();
+    expiresAt.setHours(expiresAt.getHours() + 24); // Token expires in 24 hours
+
+    await db.query(
+      `INSERT INTO email_verifications (user_id, token, email, expires_at) 
+       VALUES (?, ?, ?, ?)`,
+      [userId, verificationToken, email, expiresAt]
+    );
+
+    // Send verification email
+    try {
+      await sendVerificationEmail(email, verificationToken, firstName);
+      console.log(`✅ Verification email sent to ${email}`);
+    } catch (emailError) {
+      console.error(`⚠️ Failed to send verification email to ${email}:`, emailError.message);
+      // Continue anyway - user is registered, they can request resend later
+    }
+
     res.status(201).json({
-      message: 'Registrácia úspešná! Čaká sa na schválenie administrátorom.',
+      message: 'Registrácia úspešná! Skontrolujte svoj email pre dokončenie registrácie.',
       user: {
         id: userId,
         email,
