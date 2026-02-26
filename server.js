@@ -5,6 +5,11 @@ const errorHandler = require('./middleware/errorHandler');
 
 // Import routes
 const authRoutes = require('./routes/auth');
+const registrationRoutes = require('./routes/registration');
+const invitesRoutes = require('./routes/invites');
+const verificationRoutes = require('./routes/verification');
+const virtualPlayersRoutes = require('./routes/virtual-players');
+const privateCoachesRoutes = require('./routes/private-coaches');
 const playersRoutes = require('./routes/players');
 const teamsRoutes = require('./routes/teams');
 const clubsRoutes = require('./routes/clubs');
@@ -42,6 +47,11 @@ app.get('/health', (req, res) => {
 
 // API Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/registration', registrationRoutes);
+app.use('/api/invites', invitesRoutes);
+app.use('/api/verification', verificationRoutes);
+app.use('/api/virtual-players', virtualPlayersRoutes);
+app.use('/api/private-coaches', privateCoachesRoutes);
 app.use('/api/clubs', clubsRoutes);
 app.use('/api/players', playersRoutes);
 app.use('/api/teams', teamsRoutes);
