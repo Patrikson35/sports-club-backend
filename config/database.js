@@ -190,12 +190,41 @@ const ensureCoreTables = async () => {
   await addColumnIfMissing('ALTER TABLE teams ADD COLUMN is_active BOOLEAN DEFAULT TRUE');
   await addColumnIfMissing('ALTER TABLE teams ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP');
   await addColumnIfMissing('ALTER TABLE teams ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+  await addColumnIfMissing('ALTER TABLE club_members ADD COLUMN user_id INT NULL');
+  await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN user_id INT NULL');
   await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN jersey_number INT NULL');
   await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN position VARCHAR(50) NULL');
   await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN joined_date DATE NULL');
   await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN left_date DATE NULL');
   await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN is_active BOOLEAN DEFAULT TRUE');
   await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP');
+
+  // Legacy schema compatibility: some snapshots used member_id/player_id instead of user_id.
+  try {
+    await pool.query(
+      `UPDATE club_members
+       SET user_id = member_id
+       WHERE (user_id IS NULL OR user_id = 0)
+         AND member_id IS NOT NULL`
+    );
+  } catch (error) {
+    if (!error || error.code !== 'ER_BAD_FIELD_ERROR') {
+      throw error;
+    }
+  }
+
+  try {
+    await pool.query(
+      `UPDATE team_memberships
+       SET user_id = player_id
+       WHERE (user_id IS NULL OR user_id = 0)
+         AND player_id IS NOT NULL`
+    );
+  } catch (error) {
+    if (!error || error.code !== 'ER_BAD_FIELD_ERROR') {
+      throw error;
+    }
+  }
 
   await pool.query(`
     UPDATE teams
