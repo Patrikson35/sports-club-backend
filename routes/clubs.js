@@ -168,13 +168,19 @@ const createClubWithCompatibleColumns = async ({
 };
 
 const ensureUsersVirtualColumn = async (connection = db) => {
-  try {
-    await connection.query('ALTER TABLE users ADD COLUMN is_virtual BOOLEAN DEFAULT FALSE');
-  } catch (error) {
-    if (error?.code !== 'ER_DUP_FIELDNAME') {
-      throw error;
+  const addColumnIfMissing = async (statement) => {
+    try {
+      await connection.query(statement);
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
     }
-  }
+  };
+
+  await addColumnIfMissing('ALTER TABLE users ADD COLUMN is_virtual BOOLEAN DEFAULT FALSE');
+  await addColumnIfMissing('ALTER TABLE users ADD COLUMN phone VARCHAR(50) NULL');
+  await addColumnIfMissing('ALTER TABLE users ADD COLUMN avatar_url VARCHAR(500) NULL');
 };
 
 const ensurePlayerProfilesTable = async (connection = db) => {
