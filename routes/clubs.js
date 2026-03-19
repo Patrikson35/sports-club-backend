@@ -209,6 +209,22 @@ const ensureClubBankingColumns = async (connection = db) => {
   await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN iban VARCHAR(100) NULL');
 };
 
+const ensureClubContactColumns = async (connection = db) => {
+  const addColumnIfMissing = async (statement) => {
+    try {
+      await connection.query(statement);
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  };
+
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN email VARCHAR(255) NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN phone VARCHAR(50) NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN website VARCHAR(255) NULL');
+};
+
 const normalizeTeamIds = (input) => {
   if (!Array.isArray(input)) return [];
   return [...new Set(
@@ -379,6 +395,7 @@ router.get('/my-club', authenticateToken, async (req, res, next) => {
   try {
     const userId = req.user.id;
     await ensureClubBankingColumns(db);
+    await ensureClubContactColumns(db);
     await ensureClubSportColumn(db);
 
     const clubId = await resolveUserClubId(userId);
@@ -387,7 +404,7 @@ router.get('/my-club', authenticateToken, async (req, res, next) => {
     }
 
     const [clubs] = await db.query(
-      `SELECT id, name, address, city, country, logo_url, sport,
+      `SELECT id, name, address, city, country, email, phone, website, logo_url, sport,
               bank_name, swift_code, account_holder_name, iban
        FROM clubs
        WHERE id = ?
@@ -407,9 +424,9 @@ router.get('/my-club', authenticateToken, async (req, res, next) => {
       address: club.address || '',
       city: club.city || '',
       country: club.country || 'SK',
-      email: '',
-      phone: '',
-      website: '',
+      email: club.email || '',
+      phone: club.phone || '',
+      website: club.website || '',
       logo: normalizeClubLogoPath(club.logo_url || club.logo || ''),
       bankName: club.bank_name || '',
       swiftCode: club.swift_code || '',
@@ -1310,6 +1327,7 @@ router.post('/', authenticateToken, async (req, res, next) => {
   try {
     const userId = req.user.id;
     await ensureClubBankingColumns(db);
+    await ensureClubContactColumns(db);
     await ensureClubSportColumn(db);
     const { name, logo, address, city, country, email, phone, website, bankName, swiftCode, accountHolderName, iban } = req.body;
 
@@ -1592,6 +1610,7 @@ router.put('/my-club', authenticateToken, async (req, res, next) => {
   try {
     const userId = req.user.id;
     await ensureClubBankingColumns(db);
+    await ensureClubContactColumns(db);
     await ensureClubSportColumn(db);
     const { name, logo, address, city, country, email, phone, website, bankName, swiftCode, accountHolderName, iban, sport } = req.body;
 
