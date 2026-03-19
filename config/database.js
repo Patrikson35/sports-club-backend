@@ -136,6 +136,41 @@ const ensureCoreTables = async () => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS teams (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      club_id INT NOT NULL,
+      name VARCHAR(100) NOT NULL,
+      category VARCHAR(64) NULL,
+      age_group VARCHAR(64) NULL,
+      season VARCHAR(32) NULL,
+      coach_id INT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_teams_club (club_id),
+      INDEX idx_teams_sort (club_id, sort_order)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS team_memberships (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      team_id INT NOT NULL,
+      user_id INT NOT NULL,
+      jersey_number INT NULL,
+      position VARCHAR(50) NULL,
+      joined_date DATE NULL,
+      left_date DATE NULL,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_team_memberships_team (team_id),
+      INDEX idx_team_memberships_user (user_id),
+      INDEX idx_team_memberships_active (team_id, is_active)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `);
+
   await addColumnIfMissing('ALTER TABLE users ADD COLUMN sport VARCHAR(64) NULL');
   await addColumnIfMissing('ALTER TABLE users ADD COLUMN date_of_birth DATE NULL');
   await addColumnIfMissing('ALTER TABLE users ADD COLUMN phone VARCHAR(50) NULL');
@@ -147,6 +182,33 @@ const ensureCoreTables = async () => {
   await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN phone VARCHAR(50) NULL');
   await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN website VARCHAR(255) NULL');
   await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN is_active BOOLEAN DEFAULT TRUE');
+  await addColumnIfMissing('ALTER TABLE teams ADD COLUMN category VARCHAR(64) NULL');
+  await addColumnIfMissing('ALTER TABLE teams ADD COLUMN age_group VARCHAR(64) NULL');
+  await addColumnIfMissing('ALTER TABLE teams ADD COLUMN season VARCHAR(32) NULL');
+  await addColumnIfMissing('ALTER TABLE teams ADD COLUMN coach_id INT NULL');
+  await addColumnIfMissing('ALTER TABLE teams ADD COLUMN sort_order INT NOT NULL DEFAULT 0');
+  await addColumnIfMissing('ALTER TABLE teams ADD COLUMN is_active BOOLEAN DEFAULT TRUE');
+  await addColumnIfMissing('ALTER TABLE teams ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP');
+  await addColumnIfMissing('ALTER TABLE teams ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+  await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN jersey_number INT NULL');
+  await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN position VARCHAR(50) NULL');
+  await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN joined_date DATE NULL');
+  await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN left_date DATE NULL');
+  await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN is_active BOOLEAN DEFAULT TRUE');
+  await addColumnIfMissing('ALTER TABLE team_memberships ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP');
+
+  await pool.query(`
+    UPDATE teams
+    SET category = COALESCE(NULLIF(TRIM(category), ''), NULLIF(TRIM(name), '')),
+        age_group = COALESCE(NULLIF(TRIM(age_group), ''), NULLIF(TRIM(category), ''), NULLIF(TRIM(name), ''))
+    WHERE category IS NULL OR category = '' OR age_group IS NULL OR age_group = ''
+  `);
+
+  await pool.query(`
+    UPDATE teams
+    SET sort_order = id
+    WHERE sort_order IS NULL OR sort_order = 0
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sport_field_types (
