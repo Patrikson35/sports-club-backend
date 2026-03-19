@@ -231,6 +231,56 @@ const ensureClubContactColumns = async (connection = db) => {
   await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN website VARCHAR(255) NULL');
 };
 
+const ensureClubAttendanceDisplaySettingsColumn = async (connection = db) => {
+  const addColumnIfMissing = async (statement) => {
+    try {
+      await connection.query(statement);
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  };
+
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN attendance_display_settings LONGTEXT NULL');
+};
+
+const ensureClubTrainingExerciseDisplaySettingsColumn = async (connection = db) => {
+  const addColumnIfMissing = async (statement) => {
+    try {
+      await connection.query(statement);
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  };
+
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN training_exercise_display_settings LONGTEXT NULL');
+};
+
+const parseAttendanceDisplaySettings = (rawValue) => {
+  if (!rawValue) return {};
+
+  try {
+    const parsed = typeof rawValue === 'string' ? JSON.parse(rawValue) : rawValue;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+};
+
+const parseJsonSettingsObject = (rawValue) => {
+  if (!rawValue) return {};
+
+  try {
+    const parsed = typeof rawValue === 'string' ? JSON.parse(rawValue) : rawValue;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+};
+
 const normalizeTeamIds = (input) => {
   if (!Array.isArray(input)) return [];
   return [...new Set(
@@ -1542,6 +1592,53 @@ const normalizeSeasonRow = (row) => ({
   updatedAt: row.updated_at
 });
 
+// GET /api/clubs/my-club/attendance-display-settings
+router.get('/my-club/attendance-display-settings', authenticateToken, async (req, res, next) => {
+  try {
+    await ensureClubAttendanceDisplaySettingsColumn(db);
+    const clubId = await resolveUserClubId(req.user.id);
+    if (!clubId) return res.status(404).json({ error: 'Klub nebol nájdený' });
+
+    const [rows] = await db.query(
+      'SELECT attendance_display_settings FROM clubs WHERE id = ? LIMIT 1',
+      [clubId]
+    );
+
+    const settings = parseAttendanceDisplaySettings(rows?.[0]?.attendance_display_settings);
+    res.json({ settings });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// PUT /api/clubs/my-club/attendance-display-settings
+router.put('/my-club/attendance-display-settings', authenticateToken, async (req, res, next) => {
+  try {
+    await ensureClubAttendanceDisplaySettingsColumn(db);
+    const clubId = await resolveUserClubId(req.user.id);
+    if (!clubId) return res.status(404).json({ error: 'Klub nebol nájdený' });
+
+    const input = req.body?.settings;
+    if (input === null || input === undefined || typeof input !== 'object' || Array.isArray(input)) {
+      return res.status(400).json({ error: 'Nastavenia musia byť JSON objekt.' });
+    }
+
+    const serialized = JSON.stringify(input);
+
+    await db.query(
+      'UPDATE clubs SET attendance_display_settings = ? WHERE id = ?',
+      [serialized, clubId]
+    );
+
+    res.json({
+      message: 'Nastavenie zobrazenia ukazovateľov bolo uložené',
+      settings: input
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // GET /api/clubs/my-club/attendance-seasons
 router.get('/my-club/attendance-seasons', authenticateToken, async (req, res, next) => {
   try {
@@ -1555,6 +1652,53 @@ router.get('/my-club/attendance-seasons', authenticateToken, async (req, res, ne
     );
     res.json({ total: rows.length, seasons: rows.map(normalizeSeasonRow) });
   } catch (error) { next(error); }
+});
+
+// GET /api/clubs/my-club/training-exercise-display-settings
+router.get('/my-club/training-exercise-display-settings', authenticateToken, async (req, res, next) => {
+  try {
+    await ensureClubTrainingExerciseDisplaySettingsColumn(db);
+    const clubId = await resolveUserClubId(req.user.id);
+    if (!clubId) return res.status(404).json({ error: 'Klub nebol nájdený' });
+
+    const [rows] = await db.query(
+      'SELECT training_exercise_display_settings FROM clubs WHERE id = ? LIMIT 1',
+      [clubId]
+    );
+
+    const settings = parseJsonSettingsObject(rows?.[0]?.training_exercise_display_settings);
+    res.json({ settings });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// PUT /api/clubs/my-club/training-exercise-display-settings
+router.put('/my-club/training-exercise-display-settings', authenticateToken, async (req, res, next) => {
+  try {
+    await ensureClubTrainingExerciseDisplaySettingsColumn(db);
+    const clubId = await resolveUserClubId(req.user.id);
+    if (!clubId) return res.status(404).json({ error: 'Klub nebol nájdený' });
+
+    const input = req.body?.settings;
+    if (input === null || input === undefined || typeof input !== 'object' || Array.isArray(input)) {
+      return res.status(400).json({ error: 'Nastavenia musia byť JSON objekt.' });
+    }
+
+    const serialized = JSON.stringify(input);
+
+    await db.query(
+      'UPDATE clubs SET training_exercise_display_settings = ? WHERE id = ?',
+      [serialized, clubId]
+    );
+
+    res.json({
+      message: 'Nastavenie zobrazenia tréningov bolo uložené',
+      settings: input
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // POST /api/clubs/my-club/attendance-seasons
