@@ -138,9 +138,14 @@ const ensureCoreTables = async () => {
 
   await addColumnIfMissing('ALTER TABLE users ADD COLUMN sport VARCHAR(64) NULL');
   await addColumnIfMissing('ALTER TABLE users ADD COLUMN date_of_birth DATE NULL');
+  await addColumnIfMissing('ALTER TABLE users ADD COLUMN phone VARCHAR(50) NULL');
+  await addColumnIfMissing('ALTER TABLE users ADD COLUMN avatar_url VARCHAR(500) NULL');
   await addColumnIfMissing('ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT TRUE');
   await addColumnIfMissing('ALTER TABLE users ADD COLUMN is_verified BOOLEAN DEFAULT FALSE');
   await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN sport VARCHAR(64) NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN email VARCHAR(255) NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN phone VARCHAR(50) NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN website VARCHAR(255) NULL');
   await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN is_active BOOLEAN DEFAULT TRUE');
 
   await pool.query(`
