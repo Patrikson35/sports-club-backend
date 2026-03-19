@@ -1,51 +1,217 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
+const { authenticateToken, requireRole } = require('../middleware/auth');
+
+const PLANNER_META_MARKER = '[[PLANNER_META]]';
+
+const parsePlannerMetaInput = (recurrenceRule, sessionType, indicatorCode) => {
+  let recurrence = {};
+
+  if (typeof recurrenceRule === 'string' && recurrenceRule.trim()) {
+    try {
+      const parsed = JSON.parse(recurrenceRule);
+      if (parsed && typeof parsed === 'object') {
+        recurrence = parsed;
+      }
+    } catch {
+      recurrence = {};
+    }
+  } else if (recurrenceRule && typeof recurrenceRule === 'object') {
+    recurrence = recurrenceRule;
+  }
+
+  const resolvedSessionType = String(sessionType || recurrence.sessionType || recurrence.session_type || '').trim();
+  const resolvedIndicatorCode = String(indicatorCode || recurrence.indicatorCode || '').trim().toUpperCase();
+
+  const meta = {
+    ...recurrence,
+  };
+
+  if (resolvedSessionType) {
+    meta.sessionType = resolvedSessionType;
+  }
+  if (resolvedIndicatorCode) {
+    meta.indicatorCode = resolvedIndicatorCode;
+  }
+
+  return meta;
+};
+
+const extractPlannerMetaFromDescription = (rawDescription) => {
+  const source = String(rawDescription || '');
+  const markerIndex = source.indexOf(PLANNER_META_MARKER);
+  if (markerIndex === -1) {
+    return {
+      cleanDescription: source,
+      plannerMeta: {},
+    };
+  }
+
+  const cleanDescription = source.slice(0, markerIndex).replace(/\s+$/g, '');
+  const rawMeta = source.slice(markerIndex + PLANNER_META_MARKER.length).trim();
+
+  try {
+    const parsedMeta = JSON.parse(rawMeta);
+    return {
+      cleanDescription,
+      plannerMeta: parsedMeta && typeof parsedMeta === 'object' ? parsedMeta : {},
+    };
+  } catch {
+    return {
+      cleanDescription: source,
+      plannerMeta: {},
+    };
+  }
+};
+
+const buildDescriptionWithPlannerMeta = (description, plannerMeta) => {
+  const cleanDescription = String(description || '').trim();
+  const meta = plannerMeta && typeof plannerMeta === 'object' ? plannerMeta : {};
+  if (Object.keys(meta).length === 0) {
+    return cleanDescription || null;
+  }
+
+  const suffix = `${PLANNER_META_MARKER}${JSON.stringify(meta)}`;
+  return cleanDescription ? `${cleanDescription}\n${suffix}` : suffix;
+};
+
+const getParentScopedChildUserIds = async (connection, parentUserId) => {
+  const childIds = new Set();
+
+  try {
+    const [rows] = await connection.query(
+      'SELECT id FROM users WHERE parent_id = ?',
+      [parentUserId]
+    );
+    rows.forEach((row) => childIds.add(row.id));
+  } catch (error) {
+    if (error?.code !== 'ER_BAD_FIELD_ERROR') {
+      throw error;
+    }
+  }
+
+  try {
+    const [rows] = await connection.query(
+      'SELECT child_id AS child_user_id FROM parent_child_links WHERE parent_id = ?',
+      [parentUserId]
+    );
+    rows.forEach((row) => childIds.add(row.child_user_id));
+  } catch (error) {
+    if (error?.code !== 'ER_BAD_FIELD_ERROR' && error?.code !== 'ER_NO_SUCH_TABLE') {
+      throw error;
+    }
+  }
+
+  return [...childIds];
+};
+
+const getScopedTeamIds = async (connection, reqUser) => {
+  const role = reqUser?.role;
+
+  if (!['player', 'parent'].includes(role)) {
+    return null;
+  }
+
+  let scopedUserIds = [];
+  if (role === 'player') {
+    scopedUserIds = [reqUser.id];
+  } else {
+    scopedUserIds = await getParentScopedChildUserIds(connection, reqUser.id);
+  }
+
+  if (!scopedUserIds.length) {
+    return [];
+  }
+
+  const [rows] = await connection.query(
+    `SELECT DISTINCT team_id
+     FROM team_memberships
+     WHERE is_active = TRUE
+       AND user_id IN (${scopedUserIds.map(() => '?').join(',')})
+       AND team_id IS NOT NULL`,
+    scopedUserIds
+  );
+
+  return rows.map((row) => row.team_id);
+};
+
+const ensureTrainingAccess = async (connection, reqUser, trainingId) => {
+  const scopedTeamIds = await getScopedTeamIds(connection, reqUser);
+
+  if (!Array.isArray(scopedTeamIds)) {
+    return { allowed: true };
+  }
+
+  if (!scopedTeamIds.length) {
+    return { allowed: false };
+  }
+
+  const [trainings] = await connection.query(
+    'SELECT team_id FROM training_sessions WHERE id = ? LIMIT 1',
+    [trainingId]
+  );
+
+  if (!trainings.length) {
+    return { allowed: false, notFound: true };
+  }
+
+  return { allowed: scopedTeamIds.includes(trainings[0].team_id), notFound: false };
+};
 
 // GET /api/trainings - Get all training sessions
-router.get('/', async (req, res, next) => {
+router.get('/', authenticateToken, async (req, res, next) => {
   try {
     const { teamId, status, limit = 50 } = req.query;
+    const scopedTeamIds = await getScopedTeamIds(db, req.user);
+
+    if (Array.isArray(scopedTeamIds) && scopedTeamIds.length === 0) {
+      return res.json({ total: 0, trainings: [] });
+    }
+    
+    // Map legacy status value 'scheduled' to 'planned'
+    const dbStatus = status === 'scheduled' ? 'planned' : status;
     
     let query = `
       SELECT 
         ts.id,
         ts.team_id,
-        ts.name,
+        ts.title,
         ts.date,
         ts.start_time,
         ts.end_time,
         ts.location,
         ts.status,
-        ts.notes,
+        ts.description,
         t.name as team_name,
-        t.age_group,
-        u.first_name as coach_first_name,
-        u.last_name as coach_last_name,
-        COUNT(DISTINCT te.id) as exercise_count,
-        COUNT(DISTINCT ar.id) as attendance_count
+        t.age_group
       FROM training_sessions ts
       LEFT JOIN teams t ON ts.team_id = t.id
-      LEFT JOIN coaches c ON t.id = c.team_id
-      LEFT JOIN users u ON c.user_id = u.id
-      LEFT JOIN training_exercises te ON ts.id = te.training_session_id
-      LEFT JOIN attendance_records ar ON ts.id = ar.training_session_id
       WHERE 1=1
     `;
     
     const params = [];
     
     if (teamId) {
+      if (Array.isArray(scopedTeamIds) && !scopedTeamIds.includes(Number(teamId))) {
+        return res.json({ total: 0, trainings: [] });
+      }
+
       query += ' AND ts.team_id = ?';
       params.push(teamId);
     }
-    
-    if (status) {
-      query += ' AND ts.status = ?';
-      params.push(status);
+
+    if (Array.isArray(scopedTeamIds) && !teamId) {
+      query += ` AND ts.team_id IN (${scopedTeamIds.map(() => '?').join(',')})`;
+      params.push(...scopedTeamIds);
     }
     
-    query += ' GROUP BY ts.id ORDER BY ts.date DESC, ts.start_time DESC LIMIT ?';
+    if (dbStatus) {
+      query += ' AND ts.status = ?';
+      params.push(dbStatus);
+    }
+    
+    query += ' ORDER BY ts.date DESC, ts.start_time DESC LIMIT ?';
     params.push(parseInt(limit));
     
     const [trainings] = await db.query(query, params);
@@ -53,26 +219,31 @@ router.get('/', async (req, res, next) => {
     res.json({
       total: trainings.length,
       trainings: trainings.map(tr => ({
+        ...(() => {
+          const meta = extractPlannerMetaFromDescription(tr.description);
+          return {
+            notes: meta.cleanDescription,
+            recurrenceRule: JSON.stringify(meta.plannerMeta || {}),
+            recurrence_rule: JSON.stringify(meta.plannerMeta || {}),
+            sessionType: String(meta.plannerMeta?.sessionType || tr.session_type || ''),
+            session_type: String(meta.plannerMeta?.sessionType || tr.session_type || ''),
+          };
+        })(),
         id: tr.id,
-        name: tr.name,
+        name: tr.title,
         date: tr.date,
         startTime: tr.start_time,
         endTime: tr.end_time,
         location: tr.location,
         status: tr.status,
-        notes: tr.notes,
         team: {
           id: tr.team_id,
           name: tr.team_name,
           ageGroup: tr.age_group
         },
-        coach: tr.coach_first_name ? {
-          firstName: tr.coach_first_name,
-          lastName: tr.coach_last_name,
-          name: `${tr.coach_first_name} ${tr.coach_last_name}`
-        } : null,
-        exerciseCount: tr.exercise_count,
-        attendanceCount: tr.attendance_count
+        coach: null,
+        exerciseCount: 0,
+        attendanceCount: 0
       }))
     });
   } catch (error) {
@@ -81,27 +252,33 @@ router.get('/', async (req, res, next) => {
 });
 
 // GET /api/trainings/:id - Get training detail
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', authenticateToken, async (req, res, next) => {
   try {
+    const trainingId = Number(req.params.id);
+    const access = await ensureTrainingAccess(db, req.user, trainingId);
+    if (access.notFound) {
+      return res.status(404).json({ error: 'Training not found' });
+    }
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto tréningu' });
+    }
+
     const [trainings] = await db.query(`
       SELECT 
         ts.*,
         t.name as team_name,
-        t.age_group,
-        u.first_name as coach_first_name,
-        u.last_name as coach_last_name
+        t.age_group
       FROM training_sessions ts
       LEFT JOIN teams t ON ts.team_id = t.id
-      LEFT JOIN coaches c ON t.id = c.team_id
-      LEFT JOIN users u ON c.user_id = u.id
       WHERE ts.id = ?
-    `, [req.params.id]);
+    `, [trainingId]);
     
     if (trainings.length === 0) {
       return res.status(404).json({ error: 'Training not found' });
     }
     
     const training = trainings[0];
+    const trainingMeta = extractPlannerMetaFromDescription(training.description);
     
     // Get exercises
     const [exercises] = await db.query(`
@@ -119,7 +296,7 @@ router.get('/:id', async (req, res, next) => {
       LEFT JOIN exercise_categories ec ON e.category_id = ec.id
       WHERE te.training_session_id = ?
       ORDER BY te.sequence_order
-    `, [req.params.id]);
+    `, [trainingId]);
     
     // Get attendance
     const [attendance] = await db.query(`
@@ -138,17 +315,21 @@ router.get('/:id', async (req, res, next) => {
       LEFT JOIN team_memberships tm ON ar.user_id = tm.user_id
       WHERE ar.training_id = ?
       ORDER BY tm.jersey_number
-    `, [req.params.id]);
+    `, [trainingId]);
     
     res.json({
       id: training.id,
-      name: training.name,
+      name: training.title,
       date: training.date,
       startTime: training.start_time,
       endTime: training.end_time,
       location: training.location,
       status: training.status,
-      notes: training.notes,
+      notes: trainingMeta.cleanDescription,
+      recurrenceRule: JSON.stringify(trainingMeta.plannerMeta || {}),
+      recurrence_rule: JSON.stringify(trainingMeta.plannerMeta || {}),
+      sessionType: String(trainingMeta.plannerMeta?.sessionType || training.session_type || ''),
+      session_type: String(trainingMeta.plannerMeta?.sessionType || training.session_type || ''),
       team: {
         id: training.team_id,
         name: training.team_name,
@@ -190,18 +371,40 @@ router.get('/:id', async (req, res, next) => {
 });
 
 // POST /api/trainings - Create training session
-router.post('/', async (req, res, next) => {
+router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, res, next) => {
   try {
     const { 
       teamId, 
-      name, 
+      name,
+      title,
       date, 
-      startTime, 
-      endTime, 
+      startTime,
+      start_time,
+      endTime,
+      end_time,
       location, 
-      notes, 
+      notes,
+      description,
+      recurrence_rule,
+      recurrenceRule,
+      session_type,
+      sessionType,
+      indicatorCode,
       exercises = [] 
     } = req.body;
+
+    const resolvedTitle = title || name;
+    const resolvedStartTime = startTime || start_time;
+    const resolvedEndTime = endTime || end_time;
+    const plannerMeta = parsePlannerMetaInput(recurrence_rule || recurrenceRule, session_type || sessionType, indicatorCode);
+    const resolvedDescription = buildDescriptionWithPlannerMeta(description || notes || null, plannerMeta);
+
+    if (!teamId || !resolvedTitle || !date || !resolvedStartTime || !resolvedEndTime) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        required: ['teamId', 'title/name', 'date', 'startTime', 'endTime']
+      });
+    }
     
     const connection = await db.getConnection();
     
@@ -211,9 +414,9 @@ router.post('/', async (req, res, next) => {
       // Insert training session
       const [result] = await connection.query(`
         INSERT INTO training_sessions 
-        (team_id, name, date, start_time, end_time, location, notes, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled')
-      `, [teamId, name, date, startTime, endTime, location, notes]);
+        (team_id, title, date, start_time, end_time, location, description, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'planned')
+      `, [teamId, resolvedTitle, date, resolvedStartTime, resolvedEndTime, location || null, resolvedDescription]);
       
       const trainingId = result.insertId;
       
@@ -246,9 +449,192 @@ router.post('/', async (req, res, next) => {
   }
 });
 
-// GET /api/trainings/:id/exercises - Get training exercises
-router.get('/:id/exercises', async (req, res, next) => {
+// PUT /api/trainings/:id - Update training session
+router.put('/:id', authenticateToken, requireRole(['club', 'coach']), async (req, res, next) => {
   try {
+    const trainingId = Number(req.params.id);
+    if (!Number.isFinite(trainingId) || trainingId <= 0) {
+      return res.status(400).json({ error: 'Invalid training id' });
+    }
+
+    const {
+      teamId,
+      name,
+      title,
+      date,
+      startTime,
+      start_time,
+      endTime,
+      end_time,
+      location,
+      notes,
+      description,
+      status,
+      recurrence_rule,
+      recurrenceRule,
+      session_type,
+      sessionType,
+      indicatorCode,
+    } = req.body;
+
+    const resolvedTitle = title || name;
+    const resolvedStartTime = startTime || start_time;
+    const resolvedEndTime = endTime || end_time;
+    const plannerMetaInput = parsePlannerMetaInput(recurrence_rule || recurrenceRule, session_type || sessionType, indicatorCode);
+    let resolvedDescription = description ?? notes;
+
+    if (resolvedDescription === undefined && Object.keys(plannerMetaInput).length > 0) {
+      const [rows] = await db.query('SELECT description FROM training_sessions WHERE id = ? LIMIT 1', [trainingId]);
+      const currentDescription = rows?.[0]?.description;
+      const extracted = extractPlannerMetaFromDescription(currentDescription);
+      resolvedDescription = extracted.cleanDescription;
+    }
+
+    if (resolvedDescription !== undefined) {
+      const baseMeta = (() => {
+        if (Object.keys(plannerMetaInput).length > 0) {
+          return plannerMetaInput;
+        }
+        const extracted = extractPlannerMetaFromDescription(resolvedDescription);
+        return extracted.plannerMeta || {};
+      })();
+      resolvedDescription = buildDescriptionWithPlannerMeta(resolvedDescription, baseMeta);
+    }
+
+    const updates = [];
+    const params = [];
+
+    if (teamId !== undefined) {
+      updates.push('team_id = ?');
+      params.push(teamId);
+    }
+    if (resolvedTitle !== undefined) {
+      updates.push('title = ?');
+      params.push(resolvedTitle);
+    }
+    if (date !== undefined) {
+      updates.push('date = ?');
+      params.push(date);
+    }
+    if (resolvedStartTime !== undefined) {
+      updates.push('start_time = ?');
+      params.push(resolvedStartTime);
+    }
+    if (resolvedEndTime !== undefined) {
+      updates.push('end_time = ?');
+      params.push(resolvedEndTime);
+    }
+    if (location !== undefined) {
+      updates.push('location = ?');
+      params.push(location || null);
+    }
+    if (resolvedDescription !== undefined) {
+      updates.push('description = ?');
+      params.push(resolvedDescription || null);
+    }
+    if (status !== undefined) {
+      updates.push('status = ?');
+      params.push(status);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No updatable fields provided' });
+    }
+
+    params.push(trainingId);
+
+    const [result] = await db.query(
+      `UPDATE training_sessions SET ${updates.join(', ')} WHERE id = ?`,
+      params
+    );
+
+    if (!result?.affectedRows) {
+      return res.status(404).json({ error: 'Training not found' });
+    }
+
+    res.json({ id: trainingId, message: 'Training session updated successfully' });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// DELETE /api/trainings/:id - Delete training session
+router.delete('/:id', authenticateToken, requireRole(['club', 'coach']), async (req, res, next) => {
+  try {
+    const trainingId = Number(req.params.id);
+    if (!Number.isFinite(trainingId) || trainingId <= 0) {
+      return res.status(400).json({ error: 'Invalid training id' });
+    }
+
+    const connection = await db.getConnection();
+    try {
+      await connection.beginTransaction();
+
+      const resolveExistingColumn = async (tableName, candidateColumns) => {
+        try {
+          const [columns] = await connection.query(`SHOW COLUMNS FROM ${tableName}`);
+          const available = new Set(columns.map((column) => String(column?.Field || '').toLowerCase()));
+          return candidateColumns.find((column) => available.has(String(column).toLowerCase())) || null;
+        } catch (error) {
+          if (error?.code === 'ER_NO_SUCH_TABLE') {
+            return null;
+          }
+          throw error;
+        }
+      };
+
+      const trainingExercisesColumn = await resolveExistingColumn('training_exercises', [
+        'training_session_id',
+        'training_id',
+        'session_id',
+        'trainingId',
+      ]);
+      if (trainingExercisesColumn) {
+        await connection.query(`DELETE FROM training_exercises WHERE ${trainingExercisesColumn} = ?`, [trainingId]);
+      }
+
+      const attendanceColumn = await resolveExistingColumn('attendance', [
+        'training_session_id',
+        'training_id',
+        'session_id',
+        'trainingId',
+      ]);
+      if (attendanceColumn) {
+        await connection.query(`DELETE FROM attendance WHERE ${attendanceColumn} = ?`, [trainingId]);
+      }
+
+      const [result] = await connection.query('DELETE FROM training_sessions WHERE id = ?', [trainingId]);
+
+      if (!result?.affectedRows) {
+        await connection.rollback();
+        return res.status(404).json({ error: 'Training not found' });
+      }
+
+      await connection.commit();
+      res.json({ id: trainingId, message: 'Training session deleted successfully' });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/trainings/:id/exercises - Get training exercises
+router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
+  try {
+    const trainingId = Number(req.params.id);
+    const access = await ensureTrainingAccess(db, req.user, trainingId);
+    if (access.notFound) {
+      return res.status(404).json({ error: 'Training not found' });
+    }
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto tréningu' });
+    }
+
     const [exercises] = await db.query(`
       SELECT 
         te.id,
@@ -266,7 +652,7 @@ router.get('/:id/exercises', async (req, res, next) => {
       LEFT JOIN exercise_categories ec ON e.category_id = ec.id
       WHERE te.training_session_id = ?
       ORDER BY te.sequence_order
-    `, [req.params.id]);
+    `, [trainingId]);
     
     res.json({
       total: exercises.length,

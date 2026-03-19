@@ -9,6 +9,11 @@ const { sendEmail } = require('../services/email');
 // Helper: Generate random token
 const generateToken = () => crypto.randomBytes(32).toString('hex');
 
+const normalizeSportKey = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized || null;
+};
+
 // Helper: Calculate age from date of birth
 const calculateAge = (dob) => {
   const today = new Date();
@@ -22,7 +27,7 @@ const calculateAge = (dob) => {
 };
 
 // ============================================
-// 1. REGISTRACE KLUBU (CLUB_ADMIN)
+// 1. REGISTRACE KLUBU (CLUB)
 // ============================================
 
 router.post('/register-club', [
@@ -31,6 +36,7 @@ router.post('/register-club', [
   body('firstName').notEmpty().trim(),
   body('lastName').notEmpty().trim(),
   body('clubName').notEmpty().trim(),
+  body('sport').notEmpty().withMessage('Výber športu je povinný pri registrácii klubu').isString().trim(),
   body('country').notEmpty(),
   body('city').optional()
 ], async (req, res, next) => {
@@ -44,7 +50,12 @@ router.post('/register-club', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { email, password, firstName, lastName, clubName, country, city, address, logoUrl } = req.body;
+    const { email, password, firstName, lastName, clubName, sport, country, city, address, logoUrl } = req.body;
+    const sportKey = normalizeSportKey(sport);
+    if (!sportKey) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Pri registrácii klubu je výber športu povinný' });
+    }
 
     // Check if email exists
     const [existingUsers] = await connection.query('SELECT id FROM users WHERE email = ?', [email]);
@@ -53,21 +64,21 @@ router.post('/register-club', [
       return res.status(400).json({ error: 'Email už existuje' });
     }
 
-    // Create user with club_admin role
+    // Create user with club role
     const passwordHash = await bcrypt.hash(password, 10);
     const [userResult] = await connection.query(
-      `INSERT INTO users (email, password_hash, first_name, last_name, role, is_active, is_verified) 
-       VALUES (?, ?, ?, ?, 'club_admin', TRUE, FALSE)`,
-      [email, passwordHash, firstName, lastName]
+      `INSERT INTO users (email, password_hash, first_name, last_name, role, sport, is_active, is_verified) 
+       VALUES (?, ?, ?, ?, 'club', ?, TRUE, FALSE)`,
+      [email, passwordHash, firstName, lastName, sportKey]
     );
 
     const userId = userResult.insertId;
 
     // Create club
     const [clubResult] = await connection.query(
-      `INSERT INTO clubs (name, country, city, address, logo_url, owner_id, email, is_active) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)`,
-      [clubName, country, city || null, address || null, logoUrl || null, userId, email]
+      `INSERT INTO clubs (name, sport, country, city, address, logo_url, owner_id, email, is_active) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)`,
+      [clubName, sportKey, country, city || null, address || null, logoUrl || null, userId, email]
     );
 
     const clubId = clubResult.insertId;
@@ -108,7 +119,7 @@ router.post('/register-club', [
         email,
         firstName,
         lastName,
-        role: 'club_admin'
+        role: 'club'
       },
       club: {
         id: clubId,

@@ -1,11 +1,43 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
+const { authenticateToken, requireRole } = require('../middleware/auth');
+
+const getParentScopedChildUserIds = async (connection, parentUserId) => {
+  const childIds = new Set();
+
+  try {
+    const [rows] = await connection.query(
+      'SELECT id FROM users WHERE parent_id = ?',
+      [parentUserId]
+    );
+    rows.forEach((row) => childIds.add(row.id));
+  } catch (error) {
+    if (error?.code !== 'ER_BAD_FIELD_ERROR') {
+      throw error;
+    }
+  }
+
+  try {
+    const [rows] = await connection.query(
+      'SELECT child_id AS child_user_id FROM parent_child_links WHERE parent_id = ?',
+      [parentUserId]
+    );
+    rows.forEach((row) => childIds.add(row.child_user_id));
+  } catch (error) {
+    if (error?.code !== 'ER_BAD_FIELD_ERROR' && error?.code !== 'ER_NO_SUCH_TABLE') {
+      throw error;
+    }
+  }
+
+  return [...childIds];
+};
 
 // GET /api/attendance/:trainingId - Get attendance for training
-router.get('/:trainingId', async (req, res, next) => {
+router.get('/:trainingId', authenticateToken, async (req, res, next) => {
   try {
-    const [attendance] = await db.query(`
+    const role = req.user?.role;
+    let query = `
       SELECT 
         ar.*,
         u.id as player_id,
@@ -17,8 +49,27 @@ router.get('/:trainingId', async (req, res, next) => {
       JOIN users u ON ar.user_id = u.id
       LEFT JOIN team_memberships p ON ar.user_id = p.user_id
       WHERE ar.training_id = ?
-      ORDER BY p.jersey_number
-    `, [req.params.trainingId]);
+    `;
+
+    const params = [req.params.trainingId];
+
+    if (role === 'player') {
+      query += ' AND ar.user_id = ?';
+      params.push(req.user.id);
+    }
+
+    if (role === 'parent') {
+      const childUserIds = await getParentScopedChildUserIds(db, req.user.id);
+      if (!childUserIds.length) {
+        return res.json({ total: 0, attendance: [] });
+      }
+      query += ` AND ar.user_id IN (${childUserIds.map(() => '?').join(',')})`;
+      params.push(...childUserIds);
+    }
+
+    query += ' ORDER BY p.jersey_number';
+
+    const [attendance] = await db.query(query, params);
     
     res.json({
       total: attendance.length,
@@ -44,7 +95,7 @@ router.get('/:trainingId', async (req, res, next) => {
 });
 
 // POST /api/attendance - Record attendance
-router.post('/', async (req, res, next) => {
+router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, res, next) => {
   try {
     const { trainingSessionId, playerId, status, minutesPresent, notes, date } = req.body;
     
@@ -83,8 +134,22 @@ router.post('/', async (req, res, next) => {
 });
 
 // GET /api/attendance/player/:playerId - Get player attendance history
-router.get('/player/:playerId', async (req, res, next) => {
+router.get('/player/:playerId', authenticateToken, async (req, res, next) => {
   try {
+    const requestedPlayerId = Number(req.params.playerId);
+    const role = req.user?.role;
+
+    if (role === 'player' && requestedPlayerId !== req.user.id) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto hráčovi' });
+    }
+
+    if (role === 'parent') {
+      const childUserIds = await getParentScopedChildUserIds(db, req.user.id);
+      if (!childUserIds.includes(requestedPlayerId)) {
+        return res.status(403).json({ error: 'Nemáte prístup k tomuto hráčovi' });
+      }
+    }
+
     const { limit = 50 } = req.query;
     
     const [attendance] = await db.query(`
@@ -98,7 +163,7 @@ router.get('/player/:playerId', async (req, res, next) => {
       WHERE ar.user_id = ?
       ORDER BY ts.date DESC
       LIMIT ?
-    `, [req.params.playerId, parseInt(limit)]);
+    `, [requestedPlayerId, parseInt(limit)]);
     
     // Calculate stats
     const total = attendance.length;

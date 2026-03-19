@@ -33,14 +33,14 @@ router.post('/send', authenticate, [
     const invitedBy = req.user.id;
 
     // Validate permissions based on invite type
-    if (inviteType === 'coach' && req.user.role !== 'club_admin') {
+    if (inviteType === 'coach' && req.user.role !== 'club') {
       await connection.rollback();
-      return res.status(403).json({ error: 'Pouze club_admin může zvát trenéry' });
+      return res.status(403).json({ error: 'Pouze klub môže pozývať trénerov' });
     }
 
-    if (inviteType === 'assistant' && !['club_admin', 'coach'].includes(req.user.role)) {
+    if (inviteType === 'assistant' && !['club', 'coach', 'assistant'].includes(req.user.role)) {
       await connection.rollback();
-      return res.status(403).json({ error: 'Pouze club_admin nebo coach může zvát asistenty' });
+      return res.status(403).json({ error: 'Pozývanie asistentov je povolené pre klub, trénera alebo asistenta' });
     }
 
     // Check if email already exists
@@ -204,7 +204,7 @@ router.delete('/:inviteId', authenticate, async (req, res, next) => {
       return res.status(404).json({ error: 'Pozvánka nenalezena' });
     }
 
-    if (invites[0].invited_by !== req.user.id && req.user.role !== 'club_admin') {
+    if (invites[0].invited_by !== req.user.id && req.user.role !== 'club') {
       return res.status(403).json({ error: 'Nemáte oprávnění' });
     }
 

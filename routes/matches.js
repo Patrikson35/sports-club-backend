@@ -1,11 +1,100 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
+const { authenticateToken } = require('../middleware/auth');
+
+const getParentScopedChildUserIds = async (connection, parentUserId) => {
+  const childIds = new Set();
+
+  try {
+    const [rows] = await connection.query(
+      'SELECT id FROM users WHERE parent_id = ?',
+      [parentUserId]
+    );
+    rows.forEach((row) => childIds.add(row.id));
+  } catch (error) {
+    if (error?.code !== 'ER_BAD_FIELD_ERROR') {
+      throw error;
+    }
+  }
+
+  try {
+    const [rows] = await connection.query(
+      'SELECT child_id AS child_user_id FROM parent_child_links WHERE parent_id = ?',
+      [parentUserId]
+    );
+    rows.forEach((row) => childIds.add(row.child_user_id));
+  } catch (error) {
+    if (error?.code !== 'ER_BAD_FIELD_ERROR' && error?.code !== 'ER_NO_SUCH_TABLE') {
+      throw error;
+    }
+  }
+
+  return [...childIds];
+};
+
+const getScopedTeamIds = async (connection, reqUser) => {
+  const role = reqUser?.role;
+
+  if (!['player', 'parent'].includes(role)) {
+    return null;
+  }
+
+  let scopedUserIds = [];
+  if (role === 'player') {
+    scopedUserIds = [reqUser.id];
+  } else {
+    scopedUserIds = await getParentScopedChildUserIds(connection, reqUser.id);
+  }
+
+  if (!scopedUserIds.length) {
+    return [];
+  }
+
+  const [rows] = await connection.query(
+    `SELECT DISTINCT team_id
+     FROM team_memberships
+     WHERE is_active = TRUE
+       AND user_id IN (${scopedUserIds.map(() => '?').join(',')})
+       AND team_id IS NOT NULL`,
+    scopedUserIds
+  );
+
+  return rows.map((row) => row.team_id);
+};
+
+const ensureMatchAccess = async (connection, reqUser, matchId) => {
+  const scopedTeamIds = await getScopedTeamIds(connection, reqUser);
+
+  if (!Array.isArray(scopedTeamIds)) {
+    return { allowed: true };
+  }
+
+  if (!scopedTeamIds.length) {
+    return { allowed: false };
+  }
+
+  const [matches] = await connection.query(
+    'SELECT team_id FROM matches WHERE id = ? LIMIT 1',
+    [matchId]
+  );
+
+  if (!matches.length) {
+    return { allowed: false, notFound: true };
+  }
+
+  return { allowed: scopedTeamIds.includes(matches[0].team_id), notFound: false };
+};
 
 // GET /api/matches - Get all matches
-router.get('/', async (req, res, next) => {
+router.get('/', authenticateToken, async (req, res, next) => {
   try {
     const { teamId, status, limit = 50 } = req.query;
+    const scopedTeamIds = await getScopedTeamIds(db, req.user);
+
+    if (Array.isArray(scopedTeamIds) && scopedTeamIds.length === 0) {
+      return res.json({ total: 0, matches: [] });
+    }
     
     let query = `
       SELECT 
@@ -20,8 +109,17 @@ router.get('/', async (req, res, next) => {
     const params = [];
     
     if (teamId) {
+      if (Array.isArray(scopedTeamIds) && !scopedTeamIds.includes(Number(teamId))) {
+        return res.json({ total: 0, matches: [] });
+      }
+
       query += ' AND m.team_id = ?';
       params.push(teamId);
+    }
+
+    if (Array.isArray(scopedTeamIds) && !teamId) {
+      query += ` AND m.team_id IN (${scopedTeamIds.map(() => '?').join(',')})`;
+      params.push(...scopedTeamIds);
     }
     
     if (status) {
@@ -61,8 +159,17 @@ router.get('/', async (req, res, next) => {
 });
 
 // GET /api/matches/:id - Get match detail
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', authenticateToken, async (req, res, next) => {
   try {
+    const matchId = Number(req.params.id);
+    const access = await ensureMatchAccess(db, req.user, matchId);
+    if (access.notFound) {
+      return res.status(404).json({ error: 'Match not found' });
+    }
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto zápasu' });
+    }
+
     const [matches] = await db.query(`
       SELECT 
         m.*,
@@ -71,7 +178,7 @@ router.get('/:id', async (req, res, next) => {
       FROM matches m
       LEFT JOIN teams t ON m.team_id = t.id
       WHERE m.id = ?
-    `, [req.params.id]);
+    `, [matchId]);
     
     if (matches.length === 0) {
       return res.status(404).json({ error: 'Match not found' });
@@ -104,8 +211,17 @@ router.get('/:id', async (req, res, next) => {
 });
 
 // GET /api/matches/:id/lineup - Get match lineup
-router.get('/:id/lineup', async (req, res, next) => {
+router.get('/:id/lineup', authenticateToken, async (req, res, next) => {
   try {
+    const matchId = Number(req.params.id);
+    const access = await ensureMatchAccess(db, req.user, matchId);
+    if (access.notFound) {
+      return res.status(404).json({ error: 'Match not found' });
+    }
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto zápasu' });
+    }
+
     const [lineup] = await db.query(`
       SELECT 
         ml.*,
@@ -119,7 +235,7 @@ router.get('/:id/lineup', async (req, res, next) => {
       LEFT JOIN team_memberships tm ON ml.user_id = tm.user_id
       WHERE ml.match_id = ?
       ORDER BY ml.lineup_type, tm.jersey_number
-    `, [req.params.id]);
+    `, [matchId]);
     
     res.json({
       total: lineup.length,
@@ -156,8 +272,17 @@ router.get('/:id/lineup', async (req, res, next) => {
 });
 
 // GET /api/matches/:id/events - Get match events (goals, cards, etc.)
-router.get('/:id/events', async (req, res, next) => {
+router.get('/:id/events', authenticateToken, async (req, res, next) => {
   try {
+    const matchId = Number(req.params.id);
+    const access = await ensureMatchAccess(db, req.user, matchId);
+    if (access.notFound) {
+      return res.status(404).json({ error: 'Match not found' });
+    }
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto zápasu' });
+    }
+
     const [events] = await db.query(`
       SELECT 
         me.*,
@@ -170,7 +295,7 @@ router.get('/:id/events', async (req, res, next) => {
       LEFT JOIN team_memberships tm ON me.user_id = tm.user_id
       WHERE me.match_id = ?
       ORDER BY me.minute
-    `, [req.params.id]);
+    `, [matchId]);
     
     res.json({
       total: events.length,
@@ -195,10 +320,17 @@ router.get('/:id/events', async (req, res, next) => {
 });
 
 // GET /api/matches/table/:teamId - Get league table for team
-router.get('/table/:teamId', async (req, res, next) => {
+router.get('/table/:teamId', authenticateToken, async (req, res, next) => {
   try {
+    const teamId = Number(req.params.teamId);
+    const scopedTeamIds = await getScopedTeamIds(db, req.user);
+
+    if (Array.isArray(scopedTeamIds) && !scopedTeamIds.includes(teamId)) {
+      return res.status(403).json({ error: 'Nemáte prístup k tabuľke tohto tímu' });
+    }
+
     // Get team's age group
-    const [teams] = await db.query('SELECT age_group FROM teams WHERE id = ?', [req.params.teamId]);
+    const [teams] = await db.query('SELECT age_group FROM teams WHERE id = ?', [teamId]);
     
     if (teams.length === 0) {
       return res.status(404).json({ error: 'Team not found' });

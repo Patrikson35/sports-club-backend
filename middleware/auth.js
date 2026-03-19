@@ -1,6 +1,50 @@
 const jwt = require('jsonwebtoken');
 const db = require('../config/database');
 
+const normalizeRole = (role) => {
+  if (role === 'club_admin') return 'club';
+  return role;
+};
+
+const expandAllowedRoles = (allowedRoles) => {
+  const expanded = new Set((Array.isArray(allowedRoles) ? allowedRoles : [allowedRoles]).map(normalizeRole));
+
+  if (expanded.has('coach')) expanded.add('assistant');
+  if (expanded.has('assistant')) expanded.add('coach');
+  if (expanded.has('club')) expanded.add('club_admin');
+
+  return [...expanded];
+};
+
+const loadUserById = async (userId) => {
+  try {
+    const [users] = await db.query(
+      `SELECT id, email, first_name, last_name, role, is_active, is_verified
+       FROM users WHERE id = ?`,
+      [userId]
+    );
+
+    return users;
+  } catch (error) {
+    // Older schema fallback: missing is_active/is_verified columns.
+    if (error?.code === 'ER_BAD_FIELD_ERROR') {
+      const [users] = await db.query(
+        `SELECT id, email, first_name, last_name, role
+         FROM users WHERE id = ?`,
+        [userId]
+      );
+
+      return users.map((user) => ({
+        ...user,
+        is_active: true,
+        is_verified: true
+      }));
+    }
+
+    throw error;
+  }
+};
+
 // Verify JWT token and load full user
 const authenticate = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -14,11 +58,7 @@ const authenticate = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     
     // Load full user from database
-    const [users] = await db.query(
-      `SELECT id, email, first_name, last_name, role, is_active, is_verified, is_virtual 
-       FROM users WHERE id = ?`,
-      [decoded.id]
-    );
+    const users = await loadUserById(decoded.id);
 
     if (users.length === 0) {
       return res.status(401).json({ error: 'User not found' });
@@ -37,9 +77,9 @@ const authenticate = async (req, res, next) => {
       email: user.email,
       firstName: user.first_name,
       lastName: user.last_name,
-      role: user.role,
-      isVerified: user.is_verified,
-      isVirtual: user.is_virtual
+      role: normalizeRole(user.role),
+      originalRole: user.role,
+      isVerified: user.is_verified
     };
 
     next();
@@ -57,11 +97,7 @@ const optionalAuth = async (req, res, next) => {
     try {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       
-      const [users] = await db.query(
-        `SELECT id, email, first_name, last_name, role, is_active, is_verified 
-         FROM users WHERE id = ?`,
-        [decoded.id]
-      );
+      const users = await loadUserById(decoded.id);
 
       if (users.length > 0 && users[0].is_active) {
         const user = users[0];
@@ -70,7 +106,8 @@ const optionalAuth = async (req, res, next) => {
           email: user.email,
           firstName: user.first_name,
           lastName: user.last_name,
-          role: user.role,
+          role: normalizeRole(user.role),
+          originalRole: user.role,
           isVerified: user.is_verified
         };
       }
@@ -88,7 +125,7 @@ const requireRole = (allowedRoles) => {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
-    const roles = Array.isArray(allowedRoles) ? allowedRoles : [allowedRoles];
+    const roles = expandAllowedRoles(allowedRoles);
     
     if (!roles.includes(req.user.role)) {
       return res.status(403).json({ 
@@ -143,7 +180,7 @@ const requireClubAdmin = async (req, res, next) => {
   try {
     const [access] = await db.query(
       `SELECT id FROM club_members 
-       WHERE club_id = ? AND user_id = ? AND member_role = 'club_admin' AND is_active = TRUE`,
+       WHERE club_id = ? AND user_id = ? AND member_role IN ('club', 'club_admin') AND is_active = TRUE`,
       [clubId, req.user.id]
     );
 

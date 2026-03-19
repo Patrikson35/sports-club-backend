@@ -10,7 +10,7 @@ const { sendEmail } = require('../services/email');
 // VYTVOŘIT VIRTUÁLNÍHO HRÁČE
 // ============================================
 
-router.post('/create-virtual', authenticate, requireRole(['club_admin', 'coach']), [
+router.post('/create-virtual', authenticate, requireRole(['club', 'coach']), [
   body('firstName').notEmpty().trim(),
   body('lastName').notEmpty().trim(),
   body('teamId').isInt(),
@@ -105,7 +105,7 @@ router.post('/create-virtual', authenticate, requireRole(['club_admin', 'coach']
 // CONVERT VIRTUAL → REAL PLAYER
 // ============================================
 
-router.post('/:playerId/convert-to-real', authenticate, requireRole(['club_admin', 'coach']), [
+router.post('/:playerId/convert-to-real', authenticate, requireRole(['club', 'coach']), [
   body('parentEmail').isEmail().normalizeEmail(),
   body('parentFirstName').notEmpty().trim(),
   body('parentLastName').notEmpty().trim()
@@ -300,7 +300,7 @@ router.get('/team/:teamId/virtual-players', authenticate, async (req, res, next)
 // SMAZAT VIRTUÁLNÍHO HRÁČE
 // ============================================
 
-router.delete('/:playerId', authenticate, requireRole(['club_admin', 'coach']), async (req, res, next) => {
+router.delete('/:playerId', authenticate, requireRole(['admin']), async (req, res, next) => {
   const connection = await db.getConnection();
   
   try {

@@ -1,8 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
+const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const { authenticate, requireRole } = require('../middleware/auth');
+
+const normalizeRole = (role) => (role === 'club_admin' ? 'club' : role);
 
 // ============================================
 // OVERIT EMAIL
@@ -37,6 +40,19 @@ router.post('/verify-email', [
 
     const verification = verifications[0];
 
+    // Get user role for redirect
+    const [users] = await connection.query(
+      `SELECT id, email, first_name, last_name, role FROM users WHERE id = ?`,
+      [verification.user_id]
+    );
+
+    if (users.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Používateľ nebol nájdený' });
+    }
+
+    const user = users[0];
+
     // Update user as verified
     await connection.query(
       `UPDATE users SET is_verified = TRUE WHERE id = ?`,
@@ -51,7 +67,28 @@ router.post('/verify-email', [
 
     await connection.commit();
 
-    res.json({ message: 'Email úspěšně ověřen' });
+    // Generate JWT token for auto-login
+    const authToken = jwt.sign(
+      { 
+        id: user.id, 
+        email: user.email, 
+        role: user.role 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+
+    res.json({ 
+      message: 'Email úspešne overený',
+      token: authToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        role: normalizeRole(user.role)
+      }
+    });
   } catch (error) {
     await connection.rollback();
     next(error);

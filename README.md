@@ -81,6 +81,13 @@ SMTP_FROM="Sports Club <noreply@sportsclub.com>"
 FRONTEND_URL=https://sports-club-web-admin-production.up.railway.app
 CORS_ORIGIN=https://sports-club-web-admin-production.up.railway.app
 
+# Durable file storage (required in production)
+CLOUDINARY_CLOUD_NAME=<cloud-name>
+CLOUDINARY_API_KEY=<api-key>
+CLOUDINARY_API_SECRET=<api-secret>
+# Optional base folder in Cloudinary
+CLOUDINARY_FOLDER=sports-club
+
 # Migration
 MIGRATION_TOKEN=<secret-token>
 
@@ -89,6 +96,12 @@ BCRYPT_ROUNDS=12
 AGE_CONSENT_THRESHOLD=16
 AGE_COPPA_THRESHOLD=13
 ```
+
+## 🗂️ Production Upload Storage
+
+- V produkcii backend vyžaduje Cloudinary konfiguráciu (bez nej server nenaštartuje).
+- Lokálny disk (`/app/uploads`) je povolený iba v development režime.
+- Dôvod: Railway kontajner má ephemeral filesystem a súbory by sa po redeploy mohli stratiť.
 
 ## 📚 API Dokumentácia
 

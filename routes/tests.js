@@ -1,9 +1,40 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
+const { authenticateToken, requireRole } = require('../middleware/auth');
+
+const getParentScopedChildUserIds = async (connection, parentUserId) => {
+  const childIds = new Set();
+
+  try {
+    const [rows] = await connection.query(
+      'SELECT id FROM users WHERE parent_id = ?',
+      [parentUserId]
+    );
+    rows.forEach((row) => childIds.add(row.id));
+  } catch (error) {
+    if (error?.code !== 'ER_BAD_FIELD_ERROR') {
+      throw error;
+    }
+  }
+
+  try {
+    const [rows] = await connection.query(
+      'SELECT child_id AS child_user_id FROM parent_child_links WHERE parent_id = ?',
+      [parentUserId]
+    );
+    rows.forEach((row) => childIds.add(row.child_user_id));
+  } catch (error) {
+    if (error?.code !== 'ER_BAD_FIELD_ERROR' && error?.code !== 'ER_NO_SUCH_TABLE') {
+      throw error;
+    }
+  }
+
+  return [...childIds];
+};
 
 // GET /api/tests/categories - Get test categories
-router.get('/categories', async (req, res, next) => {
+router.get('/categories', authenticateToken, async (req, res, next) => {
   try {
     const { type } = req.query;
     
@@ -35,8 +66,9 @@ router.get('/categories', async (req, res, next) => {
 });
 
 // GET /api/tests/results - Get test results
-router.get('/results', async (req, res, next) => {
+router.get('/results', authenticateToken, async (req, res, next) => {
   try {
+    const role = req.user?.role;
     const { playerId, categoryId, limit = 100 } = req.query;
     
     let query = `
@@ -61,6 +93,33 @@ router.get('/results', async (req, res, next) => {
     if (playerId) {
       query += ' AND tr.user_id = ?';
       params.push(playerId);
+    }
+
+    if (role === 'player') {
+      if (playerId && Number(playerId) !== req.user.id) {
+        return res.status(403).json({ error: 'Nemáte prístup k tomuto hráčovi' });
+      }
+
+      if (!playerId) {
+        query += ' AND tr.user_id = ?';
+        params.push(req.user.id);
+      }
+    }
+
+    if (role === 'parent') {
+      const childUserIds = await getParentScopedChildUserIds(db, req.user.id);
+
+      if (playerId && !childUserIds.includes(Number(playerId))) {
+        return res.status(403).json({ error: 'Nemáte prístup k tomuto hráčovi' });
+      }
+
+      if (!playerId) {
+        if (!childUserIds.length) {
+          return res.json({ total: 0, results: [] });
+        }
+        query += ` AND tr.user_id IN (${childUserIds.map(() => '?').join(',')})`;
+        params.push(...childUserIds);
+      }
     }
     
     if (categoryId) {
@@ -103,8 +162,22 @@ router.get('/results', async (req, res, next) => {
 });
 
 // GET /api/tests/players/:id - Get player's test results
-router.get('/players/:id', async (req, res, next) => {
+router.get('/players/:id', authenticateToken, async (req, res, next) => {
   try {
+    const requestedPlayerId = Number(req.params.id);
+    const role = req.user?.role;
+
+    if (role === 'player' && requestedPlayerId !== req.user.id) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto hráčovi' });
+    }
+
+    if (role === 'parent') {
+      const childUserIds = await getParentScopedChildUserIds(db, req.user.id);
+      if (!childUserIds.includes(requestedPlayerId)) {
+        return res.status(403).json({ error: 'Nemáte prístup k tomuto hráčovi' });
+      }
+    }
+
     const [results] = await db.query(`
       SELECT 
         tr.*,
@@ -115,11 +188,11 @@ router.get('/players/:id', async (req, res, next) => {
       JOIN test_categories tc ON tr.test_category_id = tc.id
       WHERE tr.player_id = ?
       ORDER BY tr.test_date DESC, tc.name
-    `, [req.params.id]);
+    `, [requestedPlayerId]);
     
     res.json({
       total: results.length,
-      playerId: req.params.id,
+      playerId: requestedPlayerId,
       results: results.map(r => ({
         id: r.id,
         value: r.value,
@@ -140,7 +213,7 @@ router.get('/players/:id', async (req, res, next) => {
 });
 
 // POST /api/tests/results - Create test result
-router.post('/results', async (req, res, next) => {
+router.post('/results', authenticateToken, requireRole(['club', 'coach']), async (req, res, next) => {
   try {
     const { playerId, testCategoryId, value, testDate, notes } = req.body;
     
@@ -162,8 +235,12 @@ router.post('/results', async (req, res, next) => {
 });
 
 // GET /api/tests/stats/:categoryType - Get test statistics by category type
-router.get('/stats/:categoryType', async (req, res, next) => {
+router.get('/stats/:categoryType', authenticateToken, async (req, res, next) => {
   try {
+    if (!['admin', 'club', 'coach', 'assistant'].includes(req.user?.role)) {
+      return res.status(403).json({ error: 'Nemáte oprávnenie na prehľad tímových štatistík' });
+    }
+
     const { teamId } = req.query;
     
     let query = `
