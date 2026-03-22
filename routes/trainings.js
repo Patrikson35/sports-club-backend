@@ -76,6 +76,16 @@ const buildDescriptionWithPlannerMeta = (description, plannerMeta) => {
   return cleanDescription ? `${cleanDescription}\n${suffix}` : suffix;
 };
 
+const resolveTrainingDateColumn = async (connection = db) => {
+  const [columns] = await connection.query('SHOW COLUMNS FROM training_sessions');
+  const columnSet = new Set(columns.map((column) => String(column?.Field || '').trim().toLowerCase()));
+
+  if (columnSet.has('date')) return 'date';
+  if (columnSet.has('scheduled_date')) return 'scheduled_date';
+  if (columnSet.has('training_date')) return 'training_date';
+  return 'date';
+};
+
 const getParentScopedChildUserIds = async (connection, parentUserId) => {
   const childIds = new Set();
 
@@ -163,6 +173,7 @@ const ensureTrainingAccess = async (connection, reqUser, trainingId) => {
 router.get('/', authenticateToken, async (req, res, next) => {
   try {
     const { teamId, status, limit = 50 } = req.query;
+    const dateColumn = await resolveTrainingDateColumn(db);
     const scopedTeamIds = await getScopedTeamIds(db, req.user);
 
     if (Array.isArray(scopedTeamIds) && scopedTeamIds.length === 0) {
@@ -177,7 +188,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
         ts.id,
         ts.team_id,
         ts.title,
-        ts.date,
+        ts.${dateColumn} AS date,
         ts.start_time,
         ts.end_time,
         ts.location,
@@ -211,7 +222,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
       params.push(dbStatus);
     }
     
-    query += ' ORDER BY ts.date DESC, ts.start_time DESC LIMIT ?';
+    query += ` ORDER BY ts.${dateColumn} DESC, ts.start_time DESC LIMIT ?`;
     params.push(parseInt(limit));
     
     const [trainings] = await db.query(query, params);
@@ -255,6 +266,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
 router.get('/:id', authenticateToken, async (req, res, next) => {
   try {
     const trainingId = Number(req.params.id);
+    const dateColumn = await resolveTrainingDateColumn(db);
     const access = await ensureTrainingAccess(db, req.user, trainingId);
     if (access.notFound) {
       return res.status(404).json({ error: 'Training not found' });
@@ -266,6 +278,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     const [trainings] = await db.query(`
       SELECT 
         ts.*,
+        ts.${dateColumn} AS date,
         t.name as team_name,
         t.age_group
       FROM training_sessions ts
@@ -410,11 +423,12 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
     
     try {
       await connection.beginTransaction();
+      const dateColumn = await resolveTrainingDateColumn(connection);
       
       // Insert training session
       const [result] = await connection.query(`
         INSERT INTO training_sessions 
-        (team_id, title, date, start_time, end_time, location, description, status)
+        (team_id, title, ${dateColumn}, start_time, end_time, location, description, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'planned')
       `, [teamId, resolvedTitle, date, resolvedStartTime, resolvedEndTime, location || null, resolvedDescription]);
       
@@ -453,6 +467,7 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
 router.put('/:id', authenticateToken, requireRole(['club', 'coach']), async (req, res, next) => {
   try {
     const trainingId = Number(req.params.id);
+    const dateColumn = await resolveTrainingDateColumn(db);
     if (!Number.isFinite(trainingId) || trainingId <= 0) {
       return res.status(400).json({ error: 'Invalid training id' });
     }
@@ -513,7 +528,7 @@ router.put('/:id', authenticateToken, requireRole(['club', 'coach']), async (req
       params.push(resolvedTitle);
     }
     if (date !== undefined) {
-      updates.push('date = ?');
+      updates.push(`${dateColumn} = ?`);
       params.push(date);
     }
     if (resolvedStartTime !== undefined) {
