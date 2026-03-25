@@ -259,6 +259,24 @@ const ensureClubTrainingExerciseDisplaySettingsColumn = async (connection = db) 
   await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN training_exercise_display_settings LONGTEXT NULL');
 };
 
+const ensureClubCustomDataColumns = async (connection = db) => {
+  const addColumnIfMissing = async (statement) => {
+    try {
+      await connection.query(statement);
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  };
+
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN training_divisions_json LONGTEXT NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN exercise_categories_json LONGTEXT NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN exercise_items_json LONGTEXT NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN evidence_entries_json LONGTEXT NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN evidence_session_meta_json LONGTEXT NULL');
+};
+
 const parseAttendanceDisplaySettings = (rawValue) => {
   if (!rawValue) return {};
 
@@ -278,6 +296,17 @@ const parseJsonSettingsObject = (rawValue) => {
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
     return {};
+  }
+};
+
+const parseJsonSettingsArray = (rawValue) => {
+  if (!rawValue) return [];
+
+  try {
+    const parsed = typeof rawValue === 'string' ? JSON.parse(rawValue) : rawValue;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
 };
 
@@ -453,6 +482,8 @@ router.get('/my-club', authenticateToken, async (req, res, next) => {
     await ensureClubBankingColumns(db);
     await ensureClubContactColumns(db);
     await ensureClubSportColumn(db);
+    await ensureClubCustomDataColumns(db);
+    await ensureClubAttendanceDisplaySettingsColumn(db);
 
     const clubId = await resolveUserClubId(userId);
     if (!clubId) {
@@ -461,7 +492,10 @@ router.get('/my-club', authenticateToken, async (req, res, next) => {
 
     const [clubs] = await db.query(
       `SELECT id, name, address, city, country, email, phone, website, logo_url, sport,
-              bank_name, swift_code, account_holder_name, iban
+              bank_name, swift_code, account_holder_name, iban,
+              attendance_display_settings,
+              training_divisions_json, exercise_categories_json, exercise_items_json,
+              evidence_entries_json, evidence_session_meta_json
        FROM clubs
        WHERE id = ?
        LIMIT 1`,
@@ -489,6 +523,12 @@ router.get('/my-club', authenticateToken, async (req, res, next) => {
       accountHolderName: club.account_holder_name || '',
       iban: club.iban || '',
       sport: normalizeSportKey(club.sport) || normalizeSportKey(req.user?.sport) || '',
+      attendanceDisplaySettings: parseAttendanceDisplaySettings(club.attendance_display_settings),
+      trainingDivisions: parseJsonSettingsArray(club.training_divisions_json),
+      exerciseCategories: parseJsonSettingsArray(club.exercise_categories_json),
+      exerciseDatabaseItems: parseJsonSettingsArray(club.exercise_items_json),
+      evidenceEntries: parseJsonSettingsObject(club.evidence_entries_json),
+      evidenceSessionMeta: parseJsonSettingsObject(club.evidence_session_meta_json),
       ownerFirstName: req.user?.firstName || '',
       ownerLastName: req.user?.lastName || '',
       ownerEmail: req.user?.email || ''
@@ -1762,9 +1802,12 @@ router.put('/my-club', authenticateToken, async (req, res, next) => {
     await ensureClubBankingColumns(db);
     await ensureClubContactColumns(db);
     await ensureClubSportColumn(db);
+    await ensureClubCustomDataColumns(db);
+    await ensureClubAttendanceDisplaySettingsColumn(db);
     const { name, logo, address, city, country, email, phone, website, bankName, swiftCode, accountHolderName, iban, sport } = req.body;
 
-    if (!name || name.trim() === '') {
+    const hasNameInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'name');
+    if (hasNameInput && (!name || name.trim() === '')) {
       return res.status(400).json({ error: 'Názov klubu je povinný' });
     }
 
@@ -1777,8 +1820,13 @@ router.put('/my-club', authenticateToken, async (req, res, next) => {
     const [clubColumnsRows] = await db.query('SHOW COLUMNS FROM clubs');
     const clubColumns = new Set(clubColumnsRows.map((column) => String(column.Field || '').toLowerCase()));
 
-    const updateParts = ['name = ?'];
-    const updateValues = [name.trim()];
+    const updateParts = [];
+    const updateValues = [];
+
+    if (hasNameInput) {
+      updateParts.push('name = ?');
+      updateValues.push(name.trim());
+    }
 
     if (clubColumns.has('sport')) {
       updateParts.push('sport = COALESCE(?, sport)');
@@ -1840,8 +1888,51 @@ router.put('/my-club', authenticateToken, async (req, res, next) => {
       updateValues.push(iban || '');
     }
 
+    if (clubColumns.has('training_divisions_json') && Object.prototype.hasOwnProperty.call(req.body || {}, 'trainingDivisions')) {
+      updateParts.push('training_divisions_json = ?');
+      updateValues.push(JSON.stringify(Array.isArray(req.body.trainingDivisions) ? req.body.trainingDivisions : []));
+    }
+
+    if (clubColumns.has('exercise_categories_json') && Object.prototype.hasOwnProperty.call(req.body || {}, 'exerciseCategories')) {
+      updateParts.push('exercise_categories_json = ?');
+      updateValues.push(JSON.stringify(Array.isArray(req.body.exerciseCategories) ? req.body.exerciseCategories : []));
+    }
+
+    if (clubColumns.has('exercise_items_json') && Object.prototype.hasOwnProperty.call(req.body || {}, 'exerciseDatabaseItems')) {
+      updateParts.push('exercise_items_json = ?');
+      updateValues.push(JSON.stringify(Array.isArray(req.body.exerciseDatabaseItems) ? req.body.exerciseDatabaseItems : []));
+    }
+
+    if (clubColumns.has('evidence_entries_json') && Object.prototype.hasOwnProperty.call(req.body || {}, 'evidenceEntries')) {
+      const evidenceEntries = (req.body.evidenceEntries && typeof req.body.evidenceEntries === 'object')
+        ? req.body.evidenceEntries
+        : {};
+      updateParts.push('evidence_entries_json = ?');
+      updateValues.push(JSON.stringify(evidenceEntries));
+    }
+
+    if (clubColumns.has('evidence_session_meta_json') && Object.prototype.hasOwnProperty.call(req.body || {}, 'evidenceSessionMeta')) {
+      const evidenceSessionMeta = (req.body.evidenceSessionMeta && typeof req.body.evidenceSessionMeta === 'object')
+        ? req.body.evidenceSessionMeta
+        : {};
+      updateParts.push('evidence_session_meta_json = ?');
+      updateValues.push(JSON.stringify(evidenceSessionMeta));
+    }
+
+    if (clubColumns.has('attendance_display_settings') && Object.prototype.hasOwnProperty.call(req.body || {}, 'attendanceDisplaySettings')) {
+      const attendanceDisplaySettings = (req.body.attendanceDisplaySettings && typeof req.body.attendanceDisplaySettings === 'object')
+        ? req.body.attendanceDisplaySettings
+        : {};
+      updateParts.push('attendance_display_settings = ?');
+      updateValues.push(JSON.stringify(attendanceDisplaySettings));
+    }
+
     if (clubColumns.has('updated_at')) {
       updateParts.push('updated_at = NOW()');
+    }
+
+    if (updateParts.length === 0 || (updateParts.length === 1 && updateParts[0] === 'updated_at = NOW()')) {
+      return res.json({ message: 'Bez zmien' });
     }
 
     // Aktualizovať klub
