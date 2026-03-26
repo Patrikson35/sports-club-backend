@@ -386,6 +386,55 @@ router.post('/metrics', authenticateToken, async (req, res) => {
   res.status(201).json({ message: 'Ukazovateľ bol vytvorený.', metric: cloneMetric(created) });
 });
 
+router.put('/metrics/reorder', authenticateToken, async (req, res) => {
+  const metrics = await getMetricsForRequest(req);
+  const sourceIds = Array.isArray(req.body?.metricIds) ? req.body.metricIds : [];
+  const orderedIds = sourceIds
+    .map((id) => String(id || '').trim())
+    .filter(Boolean);
+
+  if (orderedIds.length === 0) {
+    res.status(400).json({ error: 'validation_error', message: 'Zoznam metricIds je povinný.' });
+    return;
+  }
+
+  const seen = new Set();
+  const uniqueOrderedIds = orderedIds.filter((id) => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+
+  const metricsById = new Map(metrics.map((metric) => [String(metric.id), metric]));
+  const reordered = [];
+
+  uniqueOrderedIds.forEach((id) => {
+    if (metricsById.has(id)) {
+      reordered.push(metricsById.get(id));
+      metricsById.delete(id);
+    }
+  });
+
+  // Preserve any metrics not explicitly present in payload.
+  metrics.forEach((metric) => {
+    const id = String(metric.id);
+    if (metricsById.has(id)) {
+      reordered.push(metric);
+      metricsById.delete(id);
+    }
+  });
+
+  metricStore.set(getStoreKey(req), reordered);
+  syncDefaultMetricTemplate(reordered);
+  await saveDefaultTemplateToDb(getStoreKey(req), reordered);
+
+  res.status(200).json({
+    message: 'Poradie ukazovateľov bolo uložené.',
+    total: reordered.length,
+    metrics: reordered.map(cloneMetric)
+  });
+});
+
 router.put('/metrics/:id', authenticateToken, async (req, res) => {
   const metrics = await getMetricsForRequest(req);
   const metricId = String(req.params.id || '').trim();
