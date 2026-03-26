@@ -231,6 +231,22 @@ const ensureClubContactColumns = async (connection = db) => {
   await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN website VARCHAR(255) NULL');
 };
 
+const ensureClubLocationColumns = async (connection = db) => {
+  const addColumnIfMissing = async (statement) => {
+    try {
+      await connection.query(statement);
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  };
+
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN address VARCHAR(255) NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN city VARCHAR(100) NULL');
+  await addColumnIfMissing('ALTER TABLE clubs ADD COLUMN country VARCHAR(100) NULL');
+};
+
 const ensureClubAttendanceDisplaySettingsColumn = async (connection = db) => {
   const addColumnIfMissing = async (statement) => {
     try {
@@ -480,6 +496,7 @@ router.get('/my-club', authenticateToken, async (req, res, next) => {
   try {
     const userId = req.user.id;
     await ensureClubBankingColumns(db);
+    await ensureClubLocationColumns(db);
     await ensureClubContactColumns(db);
     await ensureClubSportColumn(db);
     await ensureClubCustomDataColumns(db);
@@ -1423,6 +1440,7 @@ router.post('/', authenticateToken, async (req, res, next) => {
   try {
     const userId = req.user.id;
     await ensureClubBankingColumns(db);
+    await ensureClubLocationColumns(db);
     await ensureClubContactColumns(db);
     await ensureClubSportColumn(db);
     const { name, logo, address, city, country, email, phone, website, bankName, swiftCode, accountHolderName, iban } = req.body;
@@ -1800,6 +1818,7 @@ router.put('/my-club', authenticateToken, async (req, res, next) => {
   try {
     const userId = req.user.id;
     await ensureClubBankingColumns(db);
+    await ensureClubLocationColumns(db);
     await ensureClubContactColumns(db);
     await ensureClubSportColumn(db);
     await ensureClubCustomDataColumns(db);
@@ -1898,6 +1917,26 @@ router.put('/my-club', authenticateToken, async (req, res, next) => {
     if (clubColumns.has('iban') && hasIbanInput) {
       updateParts.push('iban = ?');
       updateValues.push(iban || '');
+    }
+
+    const requestedFieldToColumn = [
+      ['address', hasAddressInput, 'address'],
+      ['city', hasCityInput, 'city'],
+      ['country', hasCountryInput, 'country'],
+      ['email', hasEmailInput, 'email'],
+      ['phone', hasPhoneInput, 'phone'],
+      ['website', hasWebsiteInput, 'website']
+    ];
+
+    const unsupportedRequestedFields = requestedFieldToColumn
+      .filter(([, wasRequested, requiredColumn]) => wasRequested && !clubColumns.has(requiredColumn))
+      .map(([fieldName]) => fieldName);
+
+    if (unsupportedRequestedFields.length > 0) {
+      return res.status(500).json({
+        error: 'Nie je možné uložiť niektoré polia profilu klubu',
+        unsupportedFields: unsupportedRequestedFields
+      });
     }
 
     if (clubColumns.has('training_divisions_json') && Object.prototype.hasOwnProperty.call(req.body || {}, 'trainingDivisions')) {
