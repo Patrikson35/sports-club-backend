@@ -76,7 +76,59 @@ const resolveUserClubId = async (userId) => {
   );
 
   if (member.length) return member[0].club_id;
-  return null;
+
+  const [users] = await db.query('SELECT role FROM users WHERE id = ? LIMIT 1', [userId]);
+  const userRole = String(users?.[0]?.role || '').trim().toLowerCase();
+  if (userRole !== 'admin') {
+    return null;
+  }
+
+  const [adminOwned] = await db.query('SELECT id FROM clubs WHERE owner_id = ? ORDER BY id ASC LIMIT 1', [userId]);
+  if (adminOwned.length) {
+    return adminOwned[0].id;
+  }
+
+  const clubsColumns = await getClubsTableColumnSet();
+  const insertColumns = ['name'];
+  const insertValues = ['Web Admin Workspace'];
+
+  if (clubsColumns.has('owner_id')) {
+    insertColumns.push('owner_id');
+    insertValues.push(userId);
+  }
+
+  if (clubsColumns.has('country')) {
+    insertColumns.push('country');
+    insertValues.push('SK');
+  }
+
+  if (clubsColumns.has('email')) {
+    insertColumns.push('email');
+    insertValues.push('');
+  }
+
+  if (clubsColumns.has('phone')) {
+    insertColumns.push('phone');
+    insertValues.push('');
+  }
+
+  if (clubsColumns.has('website')) {
+    insertColumns.push('website');
+    insertValues.push('');
+  }
+
+  if (clubsColumns.has('created_at')) {
+    insertColumns.push('created_at');
+    insertValues.push(new Date());
+  }
+
+  const placeholders = insertColumns.map(() => '?').join(', ');
+  const [created] = await db.query(
+    `INSERT INTO clubs (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+    insertValues
+  );
+
+  return created.insertId || null;
 };
 
 const getClubsTableColumnSet = async () => {
