@@ -1807,6 +1807,18 @@ router.put('/my-club', authenticateToken, async (req, res, next) => {
     const { name, logo, address, city, country, email, phone, website, bankName, swiftCode, accountHolderName, iban, sport } = req.body;
 
     const hasNameInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'name');
+    const hasLogoInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'logo');
+    const hasAddressInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'address');
+    const hasCityInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'city');
+    const hasCountryInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'country');
+    const hasEmailInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'email');
+    const hasPhoneInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'phone');
+    const hasWebsiteInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'website');
+    const hasBankNameInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'bankName');
+    const hasSwiftCodeInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'swiftCode');
+    const hasAccountHolderNameInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'accountHolderName');
+    const hasIbanInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'iban');
+    const hasSportInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'sport');
     if (hasNameInput && (!name || name.trim() === '')) {
       return res.status(400).json({ error: 'Názov klubu je povinný' });
     }
@@ -1828,62 +1840,62 @@ router.put('/my-club', authenticateToken, async (req, res, next) => {
       updateValues.push(name.trim());
     }
 
-    if (clubColumns.has('sport')) {
+    if (clubColumns.has('sport') && hasSportInput) {
       updateParts.push('sport = COALESCE(?, sport)');
       updateValues.push(resolvedSport);
     }
 
-    if (clubColumns.has('logo_url')) {
+    if (clubColumns.has('logo_url') && hasLogoInput) {
       updateParts.push('logo_url = ?');
       updateValues.push(logo || '');
     }
 
-    if (clubColumns.has('address')) {
+    if (clubColumns.has('address') && hasAddressInput) {
       updateParts.push('address = ?');
       updateValues.push(address || '');
     }
 
-    if (clubColumns.has('city')) {
+    if (clubColumns.has('city') && hasCityInput) {
       updateParts.push('city = ?');
       updateValues.push(city || '');
     }
 
-    if (clubColumns.has('country')) {
+    if (clubColumns.has('country') && hasCountryInput) {
       updateParts.push('country = ?');
       updateValues.push(country || 'SK');
     }
 
-    if (clubColumns.has('email')) {
+    if (clubColumns.has('email') && hasEmailInput) {
       updateParts.push('email = ?');
       updateValues.push(email || '');
     }
 
-    if (clubColumns.has('phone')) {
+    if (clubColumns.has('phone') && hasPhoneInput) {
       updateParts.push('phone = ?');
       updateValues.push(phone || '');
     }
 
-    if (clubColumns.has('website')) {
+    if (clubColumns.has('website') && hasWebsiteInput) {
       updateParts.push('website = ?');
       updateValues.push(website || '');
     }
 
-    if (clubColumns.has('bank_name')) {
+    if (clubColumns.has('bank_name') && hasBankNameInput) {
       updateParts.push('bank_name = ?');
       updateValues.push(bankName || '');
     }
 
-    if (clubColumns.has('swift_code')) {
+    if (clubColumns.has('swift_code') && hasSwiftCodeInput) {
       updateParts.push('swift_code = ?');
       updateValues.push(swiftCode || '');
     }
 
-    if (clubColumns.has('account_holder_name')) {
+    if (clubColumns.has('account_holder_name') && hasAccountHolderNameInput) {
       updateParts.push('account_holder_name = ?');
       updateValues.push(accountHolderName || '');
     }
 
-    if (clubColumns.has('iban')) {
+    if (clubColumns.has('iban') && hasIbanInput) {
       updateParts.push('iban = ?');
       updateValues.push(iban || '');
     }
