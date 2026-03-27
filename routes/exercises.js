@@ -9,6 +9,8 @@ const ensureExercisesVisibilityColumns = async (connection = db) => {
     "ALTER TABLE exercises ADD COLUMN duration_minutes INT NULL",
     "ALTER TABLE exercises ADD COLUMN difficulty VARCHAR(80) NULL",
     "ALTER TABLE exercises ADD COLUMN equipment_needed TEXT NULL",
+    "ALTER TABLE exercises ADD COLUMN youtube_url TEXT NULL",
+    "ALTER TABLE exercises ADD COLUMN youtube_video_id VARCHAR(32) NULL",
     "ALTER TABLE exercises ADD COLUMN club_id INT NULL",
     "ALTER TABLE exercises ADD COLUMN created_by_user_id INT NULL",
     "ALTER TABLE exercises ADD COLUMN is_system BOOLEAN DEFAULT FALSE",
@@ -75,6 +77,33 @@ const parseCustomLabels = (value) => {
   } catch {
     return [];
   }
+};
+
+const normalizeYoutubeUrl = (value) => {
+  const normalized = String(value || '').trim();
+  return normalized || null;
+};
+
+const extractYoutubeVideoId = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+
+  const directMatch = raw.match(/^[a-zA-Z0-9_-]{11}$/);
+  if (directMatch) return directMatch[0];
+
+  const patterns = [
+    /[?&]v=([a-zA-Z0-9_-]{11})/,
+    /youtu\.be\/([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/
+  ];
+
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+
+  return null;
 };
 
 const getParentScopedChildUserIds = async (connection, parentUserId) => {
@@ -252,6 +281,10 @@ router.get('/', authenticateToken, async (req, res, next) => {
         duration: ex.duration_minutes,
         difficulty: ex.difficulty,
         equipment: ex.equipment_needed,
+        youtube: {
+          url: ex.youtube_url || null,
+          videoId: ex.youtube_video_id || extractYoutubeVideoId(ex.youtube_url)
+        },
         isSystem: Boolean(ex.is_system),
         clubId: ex.club_id || null,
         sportKey: ex.sport_key || null,
@@ -440,6 +473,10 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
       duration: exercise.duration_minutes,
       difficulty: exercise.difficulty,
       equipment: exercise.equipment_needed,
+      youtube: {
+        url: exercise.youtube_url || null,
+        videoId: exercise.youtube_video_id || extractYoutubeVideoId(exercise.youtube_url)
+      },
       isSystem: Boolean(exercise.is_system),
       clubId: exercise.club_id || null,
       sportKey: exercise.sport_key || null,
@@ -463,6 +500,7 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
       duration,
       difficulty,
       equipment,
+      youtubeUrl,
       clubId,
       isSystem,
       sportKey,
@@ -513,11 +551,13 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
     }
 
     const normalizedCustomLabels = normalizeCustomLabels(customLabels);
+    const normalizedYoutubeUrl = normalizeYoutubeUrl(youtubeUrl);
+    const normalizedYoutubeVideoId = extractYoutubeVideoId(normalizedYoutubeUrl);
 
     const [result] = await db.query(
       `INSERT INTO exercises
-        (title, description, category_id, duration_minutes, difficulty, equipment_needed, club_id, created_by_user_id, is_system, sport_key, custom_labels_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (title, description, category_id, duration_minutes, difficulty, equipment_needed, youtube_url, youtube_video_id, club_id, created_by_user_id, is_system, sport_key, custom_labels_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         normalizedTitle,
         description || null,
@@ -525,6 +565,8 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
         duration || null,
         difficulty || null,
         equipment || null,
+        normalizedYoutubeUrl,
+        normalizedYoutubeVideoId,
         resolvedClubId,
         req.user.id,
         createAsSystem,
@@ -541,6 +583,10 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
       exercise: {
         id: result.insertId,
         title: normalizedTitle,
+        youtube: {
+          url: normalizedYoutubeUrl,
+          videoId: normalizedYoutubeVideoId
+        },
         isSystem: createAsSystem,
         clubId: resolvedClubId,
         sportKey: normalizedSportKey,
