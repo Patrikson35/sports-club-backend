@@ -5,9 +5,15 @@ const { authenticateToken, requireRole } = require('../middleware/auth');
 
 const ensureExercisesVisibilityColumns = async (connection = db) => {
   const statements = [
+    "ALTER TABLE exercises ADD COLUMN category_id INT NULL",
+    "ALTER TABLE exercises ADD COLUMN duration_minutes INT NULL",
+    "ALTER TABLE exercises ADD COLUMN difficulty VARCHAR(80) NULL",
+    "ALTER TABLE exercises ADD COLUMN equipment_needed TEXT NULL",
     "ALTER TABLE exercises ADD COLUMN club_id INT NULL",
     "ALTER TABLE exercises ADD COLUMN created_by_user_id INT NULL",
-    "ALTER TABLE exercises ADD COLUMN is_system BOOLEAN DEFAULT FALSE"
+    "ALTER TABLE exercises ADD COLUMN is_system BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE exercises ADD COLUMN custom_labels_json LONGTEXT NULL",
+    "ALTER TABLE exercises ADD COLUMN sport_key VARCHAR(80) NULL"
   ];
 
   for (const statement of statements) {
@@ -18,6 +24,56 @@ const ensureExercisesVisibilityColumns = async (connection = db) => {
         throw error;
       }
     }
+  }
+};
+
+const ensureExerciseCategoryVisibilityColumns = async (connection = db) => {
+  const statements = [
+    "ALTER TABLE exercise_categories ADD COLUMN club_id INT NULL",
+    "ALTER TABLE exercise_categories ADD COLUMN created_by_user_id INT NULL",
+    "ALTER TABLE exercise_categories ADD COLUMN is_system BOOLEAN DEFAULT TRUE",
+    "ALTER TABLE exercise_categories ADD COLUMN sport_key VARCHAR(80) NULL"
+  ];
+
+  for (const statement of statements) {
+    try {
+      await connection.query(statement);
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  }
+};
+
+const normalizeCustomLabels = (value) => {
+  if (!Array.isArray(value)) return [];
+  const normalized = value
+    .map((label) => String(label || '').trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  return [...new Set(normalized)];
+};
+
+const normalizeSportKey = (value) => {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s_-]/g, '')
+    .replace(/[\s-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+  return normalized || null;
+};
+
+const parseCustomLabels = (value) => {
+  try {
+    const parsed = JSON.parse(String(value || '[]'));
+    return normalizeCustomLabels(parsed);
+  } catch {
+    return [];
   }
 };
 
@@ -125,10 +181,26 @@ const getExerciseVisibilitySql = (clubIds, alias = 'e') => {
   };
 };
 
+const getCategoryVisibilitySql = (clubIds, alias = 'ec') => {
+  if (clubIds === null) {
+    return { sql: '1=1', params: [] };
+  }
+
+  if (!Array.isArray(clubIds) || clubIds.length === 0) {
+    return { sql: `${alias}.is_system = TRUE`, params: [] };
+  }
+
+  return {
+    sql: `(${alias}.is_system = TRUE OR ${alias}.club_id IN (${clubIds.map(() => '?').join(',')}))`,
+    params: [...clubIds]
+  };
+};
+
 // GET /api/exercises - Get all exercises
 router.get('/', authenticateToken, async (req, res, next) => {
   try {
     await ensureExercisesVisibilityColumns();
+    await ensureExerciseCategoryVisibilityColumns();
 
     const accessibleClubIds = await getAccessibleClubIds(db, req.user);
     const visibility = getExerciseVisibilitySql(accessibleClubIds, 'e');
@@ -181,7 +253,9 @@ router.get('/', authenticateToken, async (req, res, next) => {
         difficulty: ex.difficulty,
         equipment: ex.equipment_needed,
         isSystem: Boolean(ex.is_system),
-        clubId: ex.club_id || null
+        clubId: ex.club_id || null,
+        sportKey: ex.sport_key || null,
+        customLabels: parseCustomLabels(ex.custom_labels_json)
       }))
     });
   } catch (error) {
@@ -193,9 +267,11 @@ router.get('/', authenticateToken, async (req, res, next) => {
 router.get('/categories', authenticateToken, async (req, res, next) => {
   try {
     await ensureExercisesVisibilityColumns();
+    await ensureExerciseCategoryVisibilityColumns();
 
     const accessibleClubIds = await getAccessibleClubIds(db, req.user);
-    const visibility = getExerciseVisibilitySql(accessibleClubIds, 'e');
+    const categoryVisibility = getCategoryVisibilitySql(accessibleClubIds, 'ec');
+    const exerciseVisibility = getExerciseVisibilitySql(accessibleClubIds, 'e');
 
     const [categories] = await db.query(`
       SELECT 
@@ -203,11 +279,12 @@ router.get('/categories', authenticateToken, async (req, res, next) => {
         COUNT(e.id) as exercise_count,
         parent.name as parent_name
       FROM exercise_categories ec
-      LEFT JOIN exercises e ON ec.id = e.category_id AND ${visibility.sql}
+      LEFT JOIN exercises e ON ec.id = e.category_id AND ${exerciseVisibility.sql}
       LEFT JOIN exercise_categories parent ON ec.parent_id = parent.id
+      WHERE ${categoryVisibility.sql}
       GROUP BY ec.id, ec.name, ec.description, ec.parent_id, parent.name
       ORDER BY ec.parent_id IS NULL DESC, ec.name
-    `, visibility.params);
+    `, [...exerciseVisibility.params, ...categoryVisibility.params]);
     
     // Build hierarchy
     const categoryMap = {};
@@ -221,6 +298,9 @@ router.get('/categories', authenticateToken, async (req, res, next) => {
         parentId: cat.parent_id,
         parentName: cat.parent_name,
         exerciseCount: cat.exercise_count,
+        isSystem: Boolean(cat.is_system),
+        clubId: cat.club_id || null,
+        sportKey: cat.sport_key || null,
         subcategories: []
       };
     });
@@ -244,10 +324,89 @@ router.get('/categories', authenticateToken, async (req, res, next) => {
   }
 });
 
+// POST /api/exercises/categories - Create exercise category
+router.post('/categories', authenticateToken, requireRole(['club', 'coach', 'admin']), async (req, res, next) => {
+  try {
+    await ensureExerciseCategoryVisibilityColumns();
+
+    const normalizedName = String(req.body?.name || '').trim();
+    const normalizedDescription = String(req.body?.description || '').trim();
+    const parentId = req.body?.parentId ? Number(req.body.parentId) : null;
+    const normalizedSportKey = normalizeSportKey(req.body?.sportKey);
+    const createAsSystem = req.user.role === 'admin' && Boolean(req.body?.isSystem);
+
+    if (!normalizedName) {
+      return res.status(400).json({ error: 'Názov kategórie je povinný' });
+    }
+
+    if (createAsSystem && !normalizedSportKey) {
+      return res.status(400).json({ error: 'Pre systémovú kategóriu je povinný výber športu' });
+    }
+
+    let resolvedClubId = null;
+    const accessibleClubIds = await getAccessibleClubIds(db, req.user);
+
+    if (!createAsSystem) {
+      if (!Array.isArray(accessibleClubIds) || accessibleClubIds.length === 0) {
+        return res.status(403).json({ error: 'Nemáte prístup do žiadneho klubu pre vytvorenie kategórie' });
+      }
+
+      const requestedClubId = req.body?.clubId ? Number(req.body.clubId) : null;
+      if (requestedClubId && accessibleClubIds.includes(requestedClubId)) {
+        resolvedClubId = requestedClubId;
+      } else {
+        resolvedClubId = accessibleClubIds[0];
+      }
+    }
+
+    if (parentId) {
+      const categoryVisibility = getCategoryVisibilitySql(createAsSystem ? null : accessibleClubIds, 'ec');
+      const [rows] = await db.query(
+        `SELECT ec.id FROM exercise_categories ec WHERE ec.id = ? AND ${categoryVisibility.sql} LIMIT 1`,
+        [parentId, ...categoryVisibility.params]
+      );
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return res.status(403).json({ error: 'Nadriadená kategória nie je dostupná' });
+      }
+    }
+
+    const [result] = await db.query(
+      `INSERT INTO exercise_categories (name, description, parent_id, club_id, created_by_user_id, is_system, sport_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        normalizedName,
+        normalizedDescription || null,
+        parentId || null,
+        resolvedClubId,
+        req.user.id,
+        createAsSystem,
+        normalizedSportKey
+      ]
+    );
+
+    return res.status(201).json({
+      id: result.insertId,
+      message: createAsSystem ? 'Základná kategória bola vytvorená' : 'Klubová kategória bola vytvorená',
+      category: {
+        id: result.insertId,
+        name: normalizedName,
+        description: normalizedDescription,
+        parentId: parentId || null,
+        isSystem: createAsSystem,
+        clubId: resolvedClubId,
+        sportKey: normalizedSportKey
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // GET /api/exercises/:id - Get exercise detail
 router.get('/:id', authenticateToken, async (req, res, next) => {
   try {
     await ensureExercisesVisibilityColumns();
+    await ensureExerciseCategoryVisibilityColumns();
 
     const accessibleClubIds = await getAccessibleClubIds(db, req.user);
     const visibility = getExerciseVisibilitySql(accessibleClubIds, 'e');
@@ -282,7 +441,9 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
       difficulty: exercise.difficulty,
       equipment: exercise.equipment_needed,
       isSystem: Boolean(exercise.is_system),
-      clubId: exercise.club_id || null
+      clubId: exercise.club_id || null,
+      sportKey: exercise.sport_key || null,
+      customLabels: parseCustomLabels(exercise.custom_labels_json)
     });
   } catch (error) {
     next(error);
@@ -293,6 +454,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
 router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), async (req, res, next) => {
   try {
     await ensureExercisesVisibilityColumns();
+    await ensureExerciseCategoryVisibilityColumns();
 
     const {
       title,
@@ -302,7 +464,9 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
       difficulty,
       equipment,
       clubId,
-      isSystem
+      isSystem,
+      sportKey,
+      customLabels
     } = req.body;
 
     const normalizedTitle = String(title || '').trim();
@@ -311,10 +475,15 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
     }
 
     const createAsSystem = req.user.role === 'admin' && Boolean(isSystem);
+    const normalizedSportKey = normalizeSportKey(sportKey);
+
+    if (createAsSystem && !normalizedSportKey) {
+      return res.status(400).json({ error: 'Pre systémové cvičenie je povinný výber športu' });
+    }
 
     let resolvedClubId = null;
+    const accessibleClubIds = await getAccessibleClubIds(db, req.user);
     if (!createAsSystem) {
-      const accessibleClubIds = await getAccessibleClubIds(db, req.user);
       if (!Array.isArray(accessibleClubIds) || accessibleClubIds.length === 0) {
         return res.status(403).json({ error: 'Nemáte prístup do žiadneho klubu pre vytvorenie interného cviku' });
       }
@@ -330,20 +499,37 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
       }
     }
 
+    const normalizedCategoryId = categoryId ? Number(categoryId) : null;
+    if (normalizedCategoryId) {
+      const categoryVisibility = getCategoryVisibilitySql(createAsSystem ? null : accessibleClubIds, 'ec');
+      const [categoryRows] = await db.query(
+        `SELECT ec.id FROM exercise_categories ec WHERE ec.id = ? AND ${categoryVisibility.sql} LIMIT 1`,
+        [normalizedCategoryId, ...categoryVisibility.params]
+      );
+
+      if (!Array.isArray(categoryRows) || categoryRows.length === 0) {
+        return res.status(403).json({ error: 'Vybraná kategória nie je pre vás dostupná' });
+      }
+    }
+
+    const normalizedCustomLabels = normalizeCustomLabels(customLabels);
+
     const [result] = await db.query(
       `INSERT INTO exercises
-        (title, description, category_id, duration_minutes, difficulty, equipment_needed, club_id, created_by_user_id, is_system)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (title, description, category_id, duration_minutes, difficulty, equipment_needed, club_id, created_by_user_id, is_system, sport_key, custom_labels_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         normalizedTitle,
         description || null,
-        categoryId || null,
+        normalizedCategoryId || null,
         duration || null,
         difficulty || null,
         equipment || null,
         resolvedClubId,
         req.user.id,
-        createAsSystem
+        createAsSystem,
+        normalizedSportKey,
+        JSON.stringify(normalizedCustomLabels)
       ]
     );
 
@@ -356,7 +542,55 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
         id: result.insertId,
         title: normalizedTitle,
         isSystem: createAsSystem,
-        clubId: resolvedClubId
+        clubId: resolvedClubId,
+        sportKey: normalizedSportKey,
+        customLabels: normalizedCustomLabels
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// PATCH /api/exercises/:id/custom-categories - Update custom exercise labels
+router.patch('/:id/custom-categories', authenticateToken, requireRole(['club', 'coach', 'admin']), async (req, res, next) => {
+  try {
+    await ensureExercisesVisibilityColumns();
+
+    const exerciseId = Number(req.params.id);
+    if (!Number.isFinite(exerciseId) || exerciseId <= 0) {
+      return res.status(400).json({ error: 'Neplatné ID cvičenia' });
+    }
+
+    const accessibleClubIds = await getAccessibleClubIds(db, req.user);
+    const visibility = getExerciseVisibilitySql(accessibleClubIds, 'e');
+    const [rows] = await db.query(
+      `SELECT e.id, e.club_id, e.is_system FROM exercises e WHERE e.id = ? AND ${visibility.sql} LIMIT 1`,
+      [exerciseId, ...visibility.params]
+    );
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(404).json({ error: 'Cvičenie sa nenašlo alebo k nemu nemáte prístup' });
+    }
+
+    const exercise = rows[0];
+    const isAdmin = req.user?.role === 'admin';
+    const isOwnerScoped = !exercise.is_system && Array.isArray(accessibleClubIds) && accessibleClubIds.includes(Number(exercise.club_id));
+    if (!isAdmin && !isOwnerScoped) {
+      return res.status(403).json({ error: 'Nemáte oprávnenie upraviť vlastné kategórie tohto cvičenia' });
+    }
+
+    const normalizedCustomLabels = normalizeCustomLabels(req.body?.customLabels);
+    await db.query(
+      'UPDATE exercises SET custom_labels_json = ? WHERE id = ? LIMIT 1',
+      [JSON.stringify(normalizedCustomLabels), exerciseId]
+    );
+
+    return res.json({
+      message: 'Vlastné kategórie cvičenia boli uložené',
+      exercise: {
+        id: exerciseId,
+        customLabels: normalizedCustomLabels
       }
     });
   } catch (error) {
