@@ -598,6 +598,115 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
   }
 });
 
+// PUT /api/exercises/:id - Update exercise
+router.put('/:id', authenticateToken, requireRole(['club', 'coach', 'admin']), async (req, res, next) => {
+  try {
+    await ensureExercisesVisibilityColumns();
+    await ensureExerciseCategoryVisibilityColumns();
+
+    const exerciseId = Number(req.params.id);
+    if (!Number.isFinite(exerciseId) || exerciseId <= 0) {
+      return res.status(400).json({ error: 'Neplatné ID cvičenia' });
+    }
+
+    const accessibleClubIds = await getAccessibleClubIds(db, req.user);
+    const visibility = getExerciseVisibilitySql(accessibleClubIds, 'e');
+    const [rows] = await db.query(
+      `SELECT e.* FROM exercises e WHERE e.id = ? AND ${visibility.sql} LIMIT 1`,
+      [exerciseId, ...visibility.params]
+    );
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(404).json({ error: 'Cvičenie sa nenašlo alebo k nemu nemáte prístup' });
+    }
+
+    const existing = rows[0];
+    const isAdmin = req.user?.role === 'admin';
+    const isOwnerScoped = !existing.is_system && Array.isArray(accessibleClubIds) && accessibleClubIds.includes(Number(existing.club_id));
+    if (!isAdmin && !isOwnerScoped) {
+      return res.status(403).json({ error: 'Nemáte oprávnenie upraviť toto cvičenie' });
+    }
+
+    const nextTitle = String(req.body?.title ?? existing.title ?? '').trim();
+    if (!nextTitle) {
+      return res.status(400).json({ error: 'Názov cviku je povinný' });
+    }
+
+    const nextDescription = req.body?.description === undefined
+      ? (existing.description || null)
+      : (String(req.body.description || '').trim() || null);
+    const nextYoutubeUrl = req.body?.youtubeUrl === undefined
+      ? (existing.youtube_url || null)
+      : normalizeYoutubeUrl(req.body.youtubeUrl);
+    const nextYoutubeVideoId = extractYoutubeVideoId(nextYoutubeUrl);
+
+    await db.query(
+      `UPDATE exercises
+       SET title = ?, description = ?, youtube_url = ?, youtube_video_id = ?
+       WHERE id = ?
+       LIMIT 1`,
+      [nextTitle, nextDescription, nextYoutubeUrl, nextYoutubeVideoId, exerciseId]
+    );
+
+    return res.json({
+      message: 'Cvičenie bolo úspešne upravené',
+      exercise: {
+        id: exerciseId,
+        title: nextTitle,
+        description: nextDescription,
+        youtube: {
+          url: nextYoutubeUrl,
+          videoId: nextYoutubeVideoId
+        }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// DELETE /api/exercises/:id - Delete exercise
+router.delete('/:id', authenticateToken, requireRole(['club', 'coach', 'admin']), async (req, res, next) => {
+  try {
+    await ensureExercisesVisibilityColumns();
+
+    const exerciseId = Number(req.params.id);
+    if (!Number.isFinite(exerciseId) || exerciseId <= 0) {
+      return res.status(400).json({ error: 'Neplatné ID cvičenia' });
+    }
+
+    const accessibleClubIds = await getAccessibleClubIds(db, req.user);
+    const visibility = getExerciseVisibilitySql(accessibleClubIds, 'e');
+    const [rows] = await db.query(
+      `SELECT e.id, e.club_id, e.is_system FROM exercises e WHERE e.id = ? AND ${visibility.sql} LIMIT 1`,
+      [exerciseId, ...visibility.params]
+    );
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(404).json({ error: 'Cvičenie sa nenašlo alebo k nemu nemáte prístup' });
+    }
+
+    const existing = rows[0];
+    const isAdmin = req.user?.role === 'admin';
+    const isOwnerScoped = !existing.is_system && Array.isArray(accessibleClubIds) && accessibleClubIds.includes(Number(existing.club_id));
+    if (!isAdmin && !isOwnerScoped) {
+      return res.status(403).json({ error: 'Nemáte oprávnenie odstrániť toto cvičenie' });
+    }
+
+    await db.query('DELETE FROM exercises WHERE id = ? LIMIT 1', [exerciseId]);
+
+    return res.json({
+      message: 'Cvičenie bolo úspešne odstránené',
+      id: exerciseId
+    });
+  } catch (error) {
+    if (error?.code === 'ER_ROW_IS_REFERENCED_2') {
+      return res.status(409).json({ error: 'Cvičenie nie je možné odstrániť, pretože je použité v iných záznamoch.' });
+    }
+    next(error);
+  }
+});
+
 // PATCH /api/exercises/:id/custom-categories - Update custom exercise labels
 router.patch('/:id/custom-categories', authenticateToken, requireRole(['club', 'coach', 'admin']), async (req, res, next) => {
   try {
