@@ -15,6 +15,96 @@ const normalizeSportKey = (value) => {
   return normalized || null;
 };
 
+const DEFAULT_REGISTRATION_SPORTS = [
+  { key: 'football', label: 'Futbal', sortOrder: 1, isActive: true },
+  { key: 'hockey', label: 'Hokej', sortOrder: 2, isActive: true },
+  { key: 'basketball', label: 'Basketbal', sortOrder: 3, isActive: true },
+  { key: 'handball', label: 'Hadzana', sortOrder: 4, isActive: true },
+  { key: 'volleyball', label: 'Volejbal', sortOrder: 5, isActive: true },
+  { key: 'tennis', label: 'Tenis', sortOrder: 6, isActive: true }
+];
+
+const normalizeSportSlug = (value) => String(value || '')
+  .trim()
+  .toLowerCase()
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .replace(/[^a-z0-9\s_-]/g, '')
+  .replace(/[\s-]+/g, '_')
+  .replace(/^_+|_+$/g, '');
+
+const ensureRegistrationSportsTable = async (connection = db) => {
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS registration_sports (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      sport_key VARCHAR(64) NOT NULL UNIQUE,
+      sport_label VARCHAR(128) NOT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_active_sort (is_active, sort_order)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  for (const item of DEFAULT_REGISTRATION_SPORTS) {
+    await connection.query(
+      `INSERT IGNORE INTO registration_sports (sport_key, sport_label, sort_order, is_active)
+       VALUES (?, ?, ?, ?)`,
+      [item.key, item.label, item.sortOrder, item.isActive]
+    );
+  }
+};
+
+const getRegistrationSportsList = async (connection = db, includeInactive = false) => {
+  await ensureRegistrationSportsTable(connection);
+
+  const [rows] = await connection.query(
+    `SELECT sport_key, sport_label, sort_order, is_active
+     FROM registration_sports
+     ${includeInactive ? '' : 'WHERE is_active = TRUE'}
+     ORDER BY sort_order ASC, sport_label ASC`
+  );
+
+  return (Array.isArray(rows) ? rows : []).map((row) => ({
+    key: String(row.sport_key || '').trim(),
+    label: String(row.sport_label || '').trim(),
+    sortOrder: Number.isFinite(Number(row.sort_order)) ? Number(row.sort_order) : 0,
+    isActive: Boolean(row.is_active)
+  })).filter((item) => item.key && item.label);
+};
+
+const normalizeSportsPayload = (value) => {
+  const source = Array.isArray(value) ? value : [];
+  const normalized = source
+    .map((item, index) => {
+      const sportKeyFromPayload = normalizeSportSlug(item?.key);
+      const sportLabel = String(item?.label || '').trim();
+      const fallbackKey = normalizeSportSlug(sportLabel);
+      const sportKey = sportKeyFromPayload || fallbackKey;
+      const rawSortOrder = Number(item?.sortOrder);
+      const sortOrder = Number.isFinite(rawSortOrder) ? rawSortOrder : (index + 1);
+
+      return {
+        key: sportKey,
+        label: sportLabel,
+        sortOrder,
+        isActive: item?.isActive !== false
+      };
+    })
+    .filter((item) => item.key && item.label);
+
+  const deduped = [];
+  const seen = new Set();
+  for (const item of normalized) {
+    if (seen.has(item.key)) continue;
+    seen.add(item.key);
+    deduped.push(item);
+  }
+
+  return deduped;
+};
+
 const resolveFrontendBaseUrl = (req) => {
   const configured = String(process.env.FRONTEND_URL || '').trim();
   const configuredIsLocal = /localhost|127\.0\.0\.1/i.test(configured);
@@ -335,6 +425,71 @@ router.post('/register', [
     });
   } catch (error) {
     next(error);
+  }
+});
+
+// GET /api/auth/registration-sports - Public registration sports list
+router.get('/registration-sports', async (req, res, next) => {
+  try {
+    const sports = await getRegistrationSportsList(db, false);
+    return res.json({
+      total: sports.length,
+      sports
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/auth/web-settings/sports - Admin managed sports list (including inactive)
+router.get('/web-settings/sports', authenticate, requireRole(['admin']), async (req, res, next) => {
+  try {
+    const sports = await getRegistrationSportsList(db, true);
+    return res.json({
+      total: sports.length,
+      sports
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// PUT /api/auth/web-settings/sports - Replace managed sports list
+router.put('/web-settings/sports', authenticate, requireRole(['admin']), async (req, res, next) => {
+  const connection = await db.getConnection();
+
+  try {
+    const sports = normalizeSportsPayload(req.body?.sports);
+
+    if (!Array.isArray(sports) || sports.length === 0) {
+      return res.status(400).json({ error: 'Zoznam sportov nemoze byt prazdny' });
+    }
+
+    await connection.beginTransaction();
+    await ensureRegistrationSportsTable(connection);
+
+    await connection.query('DELETE FROM registration_sports');
+
+    for (const item of sports) {
+      await connection.query(
+        `INSERT INTO registration_sports (sport_key, sport_label, sort_order, is_active)
+         VALUES (?, ?, ?, ?)`,
+        [item.key, item.label, item.sortOrder, item.isActive]
+      );
+    }
+
+    await connection.commit();
+
+    return res.json({
+      message: 'Nastavenie sportov bolo ulozene',
+      total: sports.length,
+      sports
+    });
+  } catch (error) {
+    await connection.rollback();
+    next(error);
+  } finally {
+    connection.release();
   }
 });
 
