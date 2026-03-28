@@ -635,6 +635,9 @@ router.put('/:id', authenticateToken, requireRole(['club', 'coach', 'admin']), a
     const nextDescription = req.body?.description === undefined
       ? (existing.description || null)
       : (String(req.body.description || '').trim() || null);
+    const nextSportKey = req.body?.sportKey === undefined
+      ? (normalizeSportKey(existing.sport_key) || null)
+      : normalizeSportKey(req.body.sportKey);
     const nextYoutubeUrl = req.body?.youtubeUrl === undefined
       ? (existing.youtube_url || null)
       : normalizeYoutubeUrl(req.body.youtubeUrl);
@@ -642,10 +645,10 @@ router.put('/:id', authenticateToken, requireRole(['club', 'coach', 'admin']), a
 
     await db.query(
       `UPDATE exercises
-       SET title = ?, description = ?, youtube_url = ?, youtube_video_id = ?
+       SET title = ?, description = ?, sport_key = ?, youtube_url = ?, youtube_video_id = ?
        WHERE id = ?
        LIMIT 1`,
-      [nextTitle, nextDescription, nextYoutubeUrl, nextYoutubeVideoId, exerciseId]
+      [nextTitle, nextDescription, nextSportKey, nextYoutubeUrl, nextYoutubeVideoId, exerciseId]
     );
 
     return res.json({
@@ -654,6 +657,7 @@ router.put('/:id', authenticateToken, requireRole(['club', 'coach', 'admin']), a
         id: exerciseId,
         title: nextTitle,
         description: nextDescription,
+        sportKey: nextSportKey,
         youtube: {
           url: nextYoutubeUrl,
           videoId: nextYoutubeVideoId
