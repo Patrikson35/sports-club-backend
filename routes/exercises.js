@@ -7,6 +7,18 @@ const ADMIN_ROLES = ['admin', 'system_admin', 'super_admin', 'founder'];
 
 const isAdminRole = (role) => ADMIN_ROLES.includes(String(role || '').trim().toLowerCase());
 
+const isPublicExerciseRecord = (record) => (
+  Boolean(record?.is_system)
+  || isAdminRole(record?.creator_role)
+  || record?.club_id == null
+);
+
+const isPublicCategoryRecord = (record) => (
+  Boolean(record?.is_system)
+  || isAdminRole(record?.creator_role)
+  || record?.club_id == null
+);
+
 const ensureExercisesVisibilityColumns = async (connection = db) => {
   const statements = [
     "ALTER TABLE exercises ADD COLUMN category_id INT NULL",
@@ -301,7 +313,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
           url: ex.youtube_url || null,
           videoId: ex.youtube_video_id || extractYoutubeVideoId(ex.youtube_url)
         },
-        isSystem: Boolean(ex.is_system) || isAdminRole(ex.creator_role),
+        isSystem: isPublicExerciseRecord(ex),
         clubId: ex.club_id || null,
         sportKey: ex.sport_key || null,
         customLabels: parseCustomLabels(ex.custom_labels_json)
@@ -349,7 +361,7 @@ router.get('/categories', authenticateToken, async (req, res, next) => {
         parentId: cat.parent_id,
         parentName: cat.parent_name,
         exerciseCount: cat.exercise_count,
-        isSystem: Boolean(cat.is_system) || isAdminRole(cat.creator_role),
+        isSystem: isPublicCategoryRecord(cat),
         clubId: cat.club_id || null,
         sportKey: cat.sport_key || null,
         subcategories: []
@@ -497,7 +509,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
         url: exercise.youtube_url || null,
         videoId: exercise.youtube_video_id || extractYoutubeVideoId(exercise.youtube_url)
       },
-      isSystem: Boolean(exercise.is_system) || isAdminRole(exercise.creator_role),
+      isSystem: isPublicExerciseRecord(exercise),
       clubId: exercise.club_id || null,
       sportKey: exercise.sport_key || null,
       customLabels: parseCustomLabels(exercise.custom_labels_json)
