@@ -3,6 +3,10 @@ const router = express.Router();
 const db = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 
+const ADMIN_ROLES = ['admin', 'system_admin', 'super_admin', 'founder'];
+
+const isAdminRole = (role) => ADMIN_ROLES.includes(String(role || '').trim().toLowerCase());
+
 const ensureExercisesVisibilityColumns = async (connection = db) => {
   const statements = [
     "ALTER TABLE exercises ADD COLUMN category_id INT NULL",
@@ -137,7 +141,7 @@ const getParentScopedChildUserIds = async (connection, parentUserId) => {
 };
 
 const getAccessibleClubIds = async (connection, user) => {
-  if (user?.role === 'admin') {
+  if (isAdminRole(user?.role)) {
     return null;
   }
 
@@ -196,32 +200,42 @@ const getAccessibleClubIds = async (connection, user) => {
 };
 
 const getExerciseVisibilitySql = (clubIds, alias = 'e') => {
+  const adminVisibilitySql = `${alias}.created_by_user_id IN (SELECT id FROM users WHERE LOWER(role) IN (${ADMIN_ROLES.map(() => '?').join(',')}))`;
+
   if (clubIds === null) {
     return { sql: '1=1', params: [] };
   }
 
   if (!Array.isArray(clubIds) || clubIds.length === 0) {
-    return { sql: `${alias}.is_system = TRUE`, params: [] };
+    return {
+      sql: `(${alias}.is_system = TRUE OR ${adminVisibilitySql})`,
+      params: [...ADMIN_ROLES]
+    };
   }
 
   return {
-    sql: `(${alias}.is_system = TRUE OR ${alias}.club_id IN (${clubIds.map(() => '?').join(',')}))`,
-    params: [...clubIds]
+    sql: `(${alias}.is_system = TRUE OR ${adminVisibilitySql} OR ${alias}.club_id IN (${clubIds.map(() => '?').join(',')}))`,
+    params: [...ADMIN_ROLES, ...clubIds]
   };
 };
 
 const getCategoryVisibilitySql = (clubIds, alias = 'ec') => {
+  const adminVisibilitySql = `${alias}.created_by_user_id IN (SELECT id FROM users WHERE LOWER(role) IN (${ADMIN_ROLES.map(() => '?').join(',')}))`;
+
   if (clubIds === null) {
     return { sql: '1=1', params: [] };
   }
 
   if (!Array.isArray(clubIds) || clubIds.length === 0) {
-    return { sql: `${alias}.is_system = TRUE`, params: [] };
+    return {
+      sql: `(${alias}.is_system = TRUE OR ${adminVisibilitySql})`,
+      params: [...ADMIN_ROLES]
+    };
   }
 
   return {
-    sql: `(${alias}.is_system = TRUE OR ${alias}.club_id IN (${clubIds.map(() => '?').join(',')}))`,
-    params: [...clubIds]
+    sql: `(${alias}.is_system = TRUE OR ${adminVisibilitySql} OR ${alias}.club_id IN (${clubIds.map(() => '?').join(',')}))`,
+    params: [...ADMIN_ROLES, ...clubIds]
   };
 };
 
@@ -238,9 +252,11 @@ router.get('/', authenticateToken, async (req, res, next) => {
     let query = `
       SELECT 
         e.*,
+        creator.role as creator_role,
         ec.name as category_name,
         ec.description as category_description
       FROM exercises e
+      LEFT JOIN users creator ON creator.id = e.created_by_user_id
       LEFT JOIN exercise_categories ec ON e.category_id = ec.id
       WHERE ${visibility.sql}
     `;
@@ -285,7 +301,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
           url: ex.youtube_url || null,
           videoId: ex.youtube_video_id || extractYoutubeVideoId(ex.youtube_url)
         },
-        isSystem: Boolean(ex.is_system),
+        isSystem: Boolean(ex.is_system) || isAdminRole(ex.creator_role),
         clubId: ex.club_id || null,
         sportKey: ex.sport_key || null,
         customLabels: parseCustomLabels(ex.custom_labels_json)
@@ -309,9 +325,11 @@ router.get('/categories', authenticateToken, async (req, res, next) => {
     const [categories] = await db.query(`
       SELECT 
         ec.*,
+        creator.role as creator_role,
         COUNT(e.id) as exercise_count,
         parent.name as parent_name
       FROM exercise_categories ec
+      LEFT JOIN users creator ON creator.id = ec.created_by_user_id
       LEFT JOIN exercises e ON ec.id = e.category_id AND ${exerciseVisibility.sql}
       LEFT JOIN exercise_categories parent ON ec.parent_id = parent.id
       WHERE ${categoryVisibility.sql}
@@ -331,7 +349,7 @@ router.get('/categories', authenticateToken, async (req, res, next) => {
         parentId: cat.parent_id,
         parentName: cat.parent_name,
         exerciseCount: cat.exercise_count,
-        isSystem: Boolean(cat.is_system),
+        isSystem: Boolean(cat.is_system) || isAdminRole(cat.creator_role),
         clubId: cat.club_id || null,
         sportKey: cat.sport_key || null,
         subcategories: []
@@ -366,7 +384,7 @@ router.post('/categories', authenticateToken, requireRole(['club', 'coach', 'adm
     const normalizedDescription = String(req.body?.description || '').trim();
     const parentId = req.body?.parentId ? Number(req.body.parentId) : null;
     const normalizedSportKey = normalizeSportKey(req.body?.sportKey);
-    const createAsSystem = req.user.role === 'admin' && Boolean(req.body?.isSystem);
+    const createAsSystem = isAdminRole(req.user.role) && Boolean(req.body?.isSystem);
 
     if (!normalizedName) {
       return res.status(400).json({ error: 'Názov kategórie je povinný' });
@@ -447,9 +465,11 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     const [exercises] = await db.query(`
       SELECT 
         e.*,
+        creator.role as creator_role,
         ec.name as category_name,
         ec.description as category_description
       FROM exercises e
+      LEFT JOIN users creator ON creator.id = e.created_by_user_id
       LEFT JOIN exercise_categories ec ON e.category_id = ec.id
       WHERE e.id = ? AND ${visibility.sql}
     `, [req.params.id, ...visibility.params]);
@@ -477,7 +497,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
         url: exercise.youtube_url || null,
         videoId: exercise.youtube_video_id || extractYoutubeVideoId(exercise.youtube_url)
       },
-      isSystem: Boolean(exercise.is_system),
+      isSystem: Boolean(exercise.is_system) || isAdminRole(exercise.creator_role),
       clubId: exercise.club_id || null,
       sportKey: exercise.sport_key || null,
       customLabels: parseCustomLabels(exercise.custom_labels_json)
@@ -512,7 +532,7 @@ router.post('/', authenticateToken, requireRole(['club', 'coach', 'admin']), asy
       return res.status(400).json({ error: 'Názov cviku je povinný' });
     }
 
-    const createAsSystem = req.user.role === 'admin' && Boolean(isSystem);
+    const createAsSystem = isAdminRole(req.user.role) && Boolean(isSystem);
     const normalizedSportKey = normalizeSportKey(sportKey);
 
     if (createAsSystem && !normalizedSportKey) {
@@ -621,7 +641,7 @@ router.put('/:id', authenticateToken, requireRole(['club', 'coach', 'admin']), a
     }
 
     const existing = rows[0];
-    const isAdmin = req.user?.role === 'admin';
+    const isAdmin = isAdminRole(req.user?.role);
     const isOwnerScoped = !existing.is_system && Array.isArray(accessibleClubIds) && accessibleClubIds.includes(Number(existing.club_id));
     if (!isAdmin && !isOwnerScoped) {
       return res.status(403).json({ error: 'Nemáte oprávnenie upraviť toto cvičenie' });

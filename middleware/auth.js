@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const db = require('../config/database');
 
 const normalizeRole = (role) => {
+  if (['system_admin', 'super_admin', 'founder'].includes(role)) return 'admin';
   if (role === 'club_admin') return 'club';
   return role;
 };
