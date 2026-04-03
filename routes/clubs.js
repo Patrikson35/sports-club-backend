@@ -1466,17 +1466,36 @@ router.delete('/my-club/trainers/:userId', authenticateToken, async (req, res, n
 // GET /api/clubs - Get all clubs
 router.get('/', authenticateToken, async (req, res, next) => {
   try {
-    const [clubs] = await db.query(`
-      SELECT 
-        c.*,
-        COUNT(DISTINCT t.id) as team_count,
-        COUNT(DISTINCT tm.user_id) as player_count
-      FROM clubs c
-      LEFT JOIN teams t ON c.id = t.club_id
-      LEFT JOIN team_memberships tm ON t.id = tm.team_id
-      GROUP BY c.id
-      ORDER BY c.created_at DESC
-    `);
+    let clubs = [];
+
+    try {
+      const [rows] = await db.query(`
+        SELECT
+          c.*,
+          COUNT(DISTINCT t.id) as team_count,
+          COUNT(DISTINCT tm.user_id) as player_count
+        FROM clubs c
+        LEFT JOIN teams t ON c.id = t.club_id
+        LEFT JOIN team_memberships tm ON t.id = tm.team_id
+        GROUP BY c.id
+        ORDER BY c.created_at DESC
+      `);
+      clubs = rows;
+    } catch (error) {
+      if (error?.code === 'ER_BAD_FIELD_ERROR' || error?.code === 'ER_NO_SUCH_TABLE') {
+        const [rows] = await db.query(`
+          SELECT
+            c.*,
+            0 AS team_count,
+            0 AS player_count
+          FROM clubs c
+          ORDER BY c.id DESC
+        `);
+        clubs = rows;
+      } else {
+        throw error;
+      }
+    }
 
     res.json({
       total: clubs.length,
