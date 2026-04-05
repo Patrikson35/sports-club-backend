@@ -378,6 +378,87 @@ const parseJsonSettingsArray = (rawValue) => {
   }
 };
 
+const normalizeTrainingDivisionsArray = (rawValue) => {
+  const parsed = Array.isArray(rawValue) ? rawValue : parseJsonSettingsArray(rawValue);
+  return parsed
+    .map((item, index) => {
+      const name = String(item?.name || '').trim();
+      const id = String(item?.id || `division-${index + 1}`).trim();
+      const groups = Array.isArray(item?.groups)
+        ? item.groups.map((groupName) => String(groupName || '').trim()).filter(Boolean)
+        : [];
+
+      return {
+        id,
+        name,
+        groups: [...new Set(groups)]
+      };
+    })
+    .filter((item) => item.id && item.name);
+};
+
+const resolveTrainingDivisionsTemplate = async (connection = db) => {
+  let rows = [];
+
+  try {
+    const [result] = await connection.query(
+      `SELECT training_divisions_json
+       FROM clubs
+       WHERE training_divisions_json IS NOT NULL
+         AND TRIM(training_divisions_json) <> ''
+         AND TRIM(training_divisions_json) <> '[]'
+       ORDER BY updated_at DESC, id DESC`
+    );
+    rows = result;
+  } catch (error) {
+    if (error?.code === 'ER_BAD_FIELD_ERROR') {
+      const [result] = await connection.query(
+        `SELECT training_divisions_json
+         FROM clubs
+         WHERE training_divisions_json IS NOT NULL
+           AND TRIM(training_divisions_json) <> ''
+           AND TRIM(training_divisions_json) <> '[]'
+         ORDER BY id DESC`
+      );
+      rows = result;
+    } else {
+      throw error;
+    }
+  }
+
+  for (const row of rows) {
+    const normalized = normalizeTrainingDivisionsArray(row?.training_divisions_json);
+    if (normalized.length > 0) {
+      return normalized;
+    }
+  }
+
+  return [];
+};
+
+const applyTrainingDivisionsDefaultToMissingClubs = async (connection = db, divisions = []) => {
+  const normalized = normalizeTrainingDivisionsArray(divisions);
+  if (normalized.length === 0) return 0;
+
+  const [result] = await connection.query(
+    `UPDATE clubs
+     SET training_divisions_json = ?
+     WHERE training_divisions_json IS NULL
+        OR TRIM(training_divisions_json) = ''
+        OR TRIM(training_divisions_json) = '[]'`,
+    [JSON.stringify(normalized)]
+  );
+
+  return Number(result?.affectedRows || 0);
+};
+
+const ensureTrainingDivisionsDefaultForAllClubs = async (connection = db) => {
+  await ensureClubCustomDataColumns(connection);
+  const template = await resolveTrainingDivisionsTemplate(connection);
+  if (template.length === 0) return 0;
+  return applyTrainingDivisionsDefaultToMissingClubs(connection, template);
+};
+
 const normalizeTeamIds = (input) => {
   if (!Array.isArray(input)) return [];
   return [...new Set(
@@ -553,6 +634,7 @@ router.get('/my-club', authenticateToken, async (req, res, next) => {
     await ensureClubSportColumn(db);
     await ensureClubCustomDataColumns(db);
     await ensureClubAttendanceDisplaySettingsColumn(db);
+    await ensureTrainingDivisionsDefaultForAllClubs(db);
 
     const clubId = await resolveUserClubId(userId);
     if (!clubId) {
@@ -2064,6 +2146,10 @@ router.put('/my-club', authenticateToken, async (req, res, next) => {
        WHERE id = ?`,
       [...updateValues, clubId]
     );
+
+    if (clubColumns.has('training_divisions_json') && Object.prototype.hasOwnProperty.call(req.body || {}, 'trainingDivisions')) {
+      await applyTrainingDivisionsDefaultToMissingClubs(db, req.body.trainingDivisions);
+    }
 
     res.json({
       message: 'Klub bol úspešne aktualizovaný'
