@@ -3,6 +3,75 @@ const router = express.Router();
 const db = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
+let matchEvidenceTablesReady = false;
+
+const ensureMatchEvidenceTables = async () => {
+  if (matchEvidenceTablesReady) return;
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS match_category_settings (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      team_id INT NOT NULL,
+      category_key VARCHAR(64) NOT NULL,
+      indicators_json JSON NOT NULL,
+      updated_by INT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_team_category (team_id, category_key),
+      INDEX idx_team (team_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS match_evidence (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      match_id INT NOT NULL,
+      home_score INT NULL,
+      away_score INT NULL,
+      scorers_json JSON NULL,
+      cards_json JSON NULL,
+      updated_by INT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_match (match_id),
+      INDEX idx_match (match_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS match_pairings (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      match_id INT NOT NULL,
+      paired_club_id INT NOT NULL,
+      status ENUM('pending', 'confirmed') DEFAULT 'pending',
+      updated_by INT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_match_pairing (match_id),
+      INDEX idx_paired_club (paired_club_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `);
+
+  matchEvidenceTablesReady = true;
+};
+
+const normalizeIndicators = (value) => {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    result: source.result !== false,
+    scorers: source.scorers !== false,
+    yellowCards: Boolean(source.yellowCards),
+    redCards: Boolean(source.redCards),
+  };
+};
+
+const parseJsonSafe = (value, fallback) => {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+};
+
 const getParentScopedChildUserIds = async (connection, parentUserId) => {
   const childIds = new Set();
 
@@ -380,6 +449,214 @@ router.get('/table/:teamId', authenticateToken, async (req, res, next) => {
         goalDifference: r.goal_difference || 0,
         points: r.points || 0
       }))
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/matches/settings/category-indicators - get indicators settings per category/team
+router.get('/settings/category-indicators', authenticateToken, async (req, res, next) => {
+  try {
+    await ensureMatchEvidenceTables();
+
+    const scopedTeamIds = await getScopedTeamIds(db, req.user);
+    const requestedTeamId = Number(req.query.teamId || 0);
+
+    let whereSql = '';
+    const params = [];
+
+    if (Array.isArray(scopedTeamIds)) {
+      if (!scopedTeamIds.length) {
+        return res.json({ total: 0, settings: [] });
+      }
+      whereSql = `WHERE mcs.team_id IN (${scopedTeamIds.map(() => '?').join(',')})`;
+      params.push(...scopedTeamIds);
+    }
+
+    if (requestedTeamId > 0) {
+      if (Array.isArray(scopedTeamIds) && !scopedTeamIds.includes(requestedTeamId)) {
+        return res.status(403).json({ error: 'Nemáte prístup k tomuto tímu' });
+      }
+      whereSql += whereSql ? ' AND mcs.team_id = ?' : 'WHERE mcs.team_id = ?';
+      params.push(requestedTeamId);
+    }
+
+    const [rows] = await db.query(
+      `SELECT
+        mcs.id,
+        mcs.team_id,
+        mcs.category_key,
+        mcs.indicators_json,
+        t.name AS team_name,
+        t.age_group
+      FROM match_category_settings mcs
+      LEFT JOIN teams t ON t.id = mcs.team_id
+      ${whereSql}
+      ORDER BY mcs.team_id, mcs.category_key`,
+      params
+    );
+
+    return res.json({
+      total: rows.length,
+      settings: rows.map((row) => ({
+        id: row.id,
+        teamId: row.team_id,
+        teamName: row.team_name,
+        ageGroup: row.age_group,
+        categoryKey: row.category_key,
+        indicators: normalizeIndicators(parseJsonSafe(row.indicators_json, {})),
+      })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// PUT /api/matches/settings/category-indicators - upsert category indicators
+router.put('/settings/category-indicators', authenticateToken, async (req, res, next) => {
+  try {
+    await ensureMatchEvidenceTables();
+
+    const teamId = Number(req.body?.teamId || 0);
+    const categoryKey = String(req.body?.categoryKey || '').trim();
+    const indicators = normalizeIndicators(req.body?.indicators);
+
+    if (!teamId || !categoryKey) {
+      return res.status(400).json({ error: 'teamId a categoryKey sú povinné' });
+    }
+
+    const scopedTeamIds = await getScopedTeamIds(db, req.user);
+    if (Array.isArray(scopedTeamIds) && !scopedTeamIds.includes(teamId)) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto tímu' });
+    }
+
+    await db.query(
+      `INSERT INTO match_category_settings (team_id, category_key, indicators_json, updated_by)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE indicators_json = VALUES(indicators_json), updated_by = VALUES(updated_by)`,
+      [teamId, categoryKey, JSON.stringify(indicators), req.user?.id || null]
+    );
+
+    return res.json({
+      message: 'Nastavenie kategórie bolo uložené',
+      setting: { teamId, categoryKey, indicators },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/matches/:id/evidence - get custom match evidence and pairing
+router.get('/:id/evidence', authenticateToken, async (req, res, next) => {
+  try {
+    await ensureMatchEvidenceTables();
+
+    const matchId = Number(req.params.id);
+    const access = await ensureMatchAccess(db, req.user, matchId);
+    if (access.notFound) {
+      return res.status(404).json({ error: 'Match not found' });
+    }
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto zápasu' });
+    }
+
+    const [[evidenceRow] = []] = await db.query(
+      `SELECT home_score, away_score, scorers_json, cards_json
+       FROM match_evidence
+       WHERE match_id = ?
+       LIMIT 1`,
+      [matchId]
+    );
+
+    const [[pairingRow] = []] = await db.query(
+      `SELECT mp.paired_club_id, mp.status, c.name AS paired_club_name
+       FROM match_pairings mp
+       LEFT JOIN clubs c ON c.id = mp.paired_club_id
+       WHERE mp.match_id = ?
+       LIMIT 1`,
+      [matchId]
+    );
+
+    return res.json({
+      matchId,
+      evidence: {
+        homeScore: evidenceRow?.home_score ?? null,
+        awayScore: evidenceRow?.away_score ?? null,
+        scorers: parseJsonSafe(evidenceRow?.scorers_json, []),
+        cards: parseJsonSafe(evidenceRow?.cards_json, []),
+      },
+      pairing: pairingRow
+        ? {
+            pairedClubId: pairingRow.paired_club_id,
+            pairedClubName: pairingRow.paired_club_name,
+            status: pairingRow.status,
+          }
+        : null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// PUT /api/matches/:id/evidence - upsert match evidence and optional pairing
+router.put('/:id/evidence', authenticateToken, async (req, res, next) => {
+  try {
+    await ensureMatchEvidenceTables();
+
+    const matchId = Number(req.params.id);
+    const access = await ensureMatchAccess(db, req.user, matchId);
+    if (access.notFound) {
+      return res.status(404).json({ error: 'Match not found' });
+    }
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto zápasu' });
+    }
+
+    const homeScore = req.body?.homeScore === '' || req.body?.homeScore === null || req.body?.homeScore === undefined
+      ? null
+      : Number(req.body.homeScore);
+    const awayScore = req.body?.awayScore === '' || req.body?.awayScore === null || req.body?.awayScore === undefined
+      ? null
+      : Number(req.body.awayScore);
+    const scorers = Array.isArray(req.body?.scorers) ? req.body.scorers : [];
+    const cards = Array.isArray(req.body?.cards) ? req.body.cards : [];
+    const pairedClubId = Number(req.body?.pairedClubId || 0);
+
+    await db.query(
+      `INSERT INTO match_evidence (match_id, home_score, away_score, scorers_json, cards_json, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         home_score = VALUES(home_score),
+         away_score = VALUES(away_score),
+         scorers_json = VALUES(scorers_json),
+         cards_json = VALUES(cards_json),
+         updated_by = VALUES(updated_by)`,
+      [matchId, Number.isFinite(homeScore) ? homeScore : null, Number.isFinite(awayScore) ? awayScore : null, JSON.stringify(scorers), JSON.stringify(cards), req.user?.id || null]
+    );
+
+    if (pairedClubId > 0) {
+      const [clubs] = await db.query('SELECT id, name FROM clubs WHERE id = ? LIMIT 1', [pairedClubId]);
+      if (!clubs.length) {
+        return res.status(400).json({ error: 'Sparovaný klub neexistuje' });
+      }
+
+      await db.query(
+        `INSERT INTO match_pairings (match_id, paired_club_id, status, updated_by)
+         VALUES (?, ?, 'pending', ?)
+         ON DUPLICATE KEY UPDATE
+           paired_club_id = VALUES(paired_club_id),
+           status = 'pending',
+           updated_by = VALUES(updated_by)`,
+        [matchId, pairedClubId, req.user?.id || null]
+      );
+    } else {
+      await db.query('DELETE FROM match_pairings WHERE match_id = ?', [matchId]);
+    }
+
+    return res.json({
+      message: 'Evidencia zápasu bola uložená',
+      matchId,
     });
   } catch (error) {
     next(error);
