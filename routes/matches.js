@@ -28,6 +28,7 @@ const ensureMatchEvidenceTables = async () => {
       home_score INT NULL,
       away_score INT NULL,
       scorers_json JSON NULL,
+      assists_json JSON NULL,
       cards_json JSON NULL,
       updated_by INT NULL,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -49,6 +50,21 @@ const ensureMatchEvidenceTables = async () => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `);
 
+  try {
+    const [columns] = await db.query('SHOW COLUMNS FROM match_evidence');
+    const hasAssistsColumn = Array.isArray(columns)
+      ? columns.some((column) => String(column?.Field || '').trim().toLowerCase() === 'assists_json')
+      : false;
+
+    if (!hasAssistsColumn) {
+      await db.query('ALTER TABLE match_evidence ADD COLUMN assists_json JSON NULL AFTER scorers_json');
+    }
+  } catch (error) {
+    if (error?.code !== 'ER_DUP_FIELDNAME') {
+      throw error;
+    }
+  }
+
   matchEvidenceTablesReady = true;
 };
 
@@ -57,6 +73,7 @@ const normalizeIndicators = (value) => {
   return {
     result: source.result !== false,
     scorers: source.scorers !== false,
+    assists: Boolean(source.assists),
     yellowCards: Boolean(source.yellowCards),
     redCards: Boolean(source.redCards),
   };
@@ -562,7 +579,7 @@ router.get('/:id/evidence', authenticateToken, async (req, res, next) => {
     }
 
     const [[evidenceRow] = []] = await db.query(
-      `SELECT home_score, away_score, scorers_json, cards_json
+      `SELECT home_score, away_score, scorers_json, assists_json, cards_json
        FROM match_evidence
        WHERE match_id = ?
        LIMIT 1`,
@@ -584,6 +601,7 @@ router.get('/:id/evidence', authenticateToken, async (req, res, next) => {
         homeScore: evidenceRow?.home_score ?? null,
         awayScore: evidenceRow?.away_score ?? null,
         scorers: parseJsonSafe(evidenceRow?.scorers_json, []),
+        assists: parseJsonSafe(evidenceRow?.assists_json, []),
         cards: parseJsonSafe(evidenceRow?.cards_json, []),
       },
       pairing: pairingRow
@@ -620,19 +638,29 @@ router.put('/:id/evidence', authenticateToken, async (req, res, next) => {
       ? null
       : Number(req.body.awayScore);
     const scorers = Array.isArray(req.body?.scorers) ? req.body.scorers : [];
+    const assists = Array.isArray(req.body?.assists) ? req.body.assists : [];
     const cards = Array.isArray(req.body?.cards) ? req.body.cards : [];
     const pairedClubId = Number(req.body?.pairedClubId || 0);
 
     await db.query(
-      `INSERT INTO match_evidence (match_id, home_score, away_score, scorers_json, cards_json, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO match_evidence (match_id, home_score, away_score, scorers_json, assists_json, cards_json, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          home_score = VALUES(home_score),
          away_score = VALUES(away_score),
          scorers_json = VALUES(scorers_json),
+         assists_json = VALUES(assists_json),
          cards_json = VALUES(cards_json),
          updated_by = VALUES(updated_by)`,
-      [matchId, Number.isFinite(homeScore) ? homeScore : null, Number.isFinite(awayScore) ? awayScore : null, JSON.stringify(scorers), JSON.stringify(cards), req.user?.id || null]
+      [
+        matchId,
+        Number.isFinite(homeScore) ? homeScore : null,
+        Number.isFinite(awayScore) ? awayScore : null,
+        JSON.stringify(scorers),
+        JSON.stringify(assists),
+        JSON.stringify(cards),
+        req.user?.id || null,
+      ]
     );
 
     if (pairedClubId > 0) {
