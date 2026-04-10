@@ -419,6 +419,48 @@ router.post('/', authenticateToken, async (req, res, next) => {
   }
 });
 
+// DELETE /api/matches/:id - Delete match
+router.delete('/:id', authenticateToken, async (req, res, next) => {
+  const connection = await db.getConnection();
+  let transactionStarted = false;
+
+  try {
+    const matchId = Number(req.params.id);
+    if (!Number.isInteger(matchId) || matchId <= 0) {
+      return res.status(400).json({ error: 'Neplatné matchId' });
+    }
+
+    const access = await ensureMatchAccess(connection, req.user, matchId);
+    if (access.notFound) {
+      return res.status(404).json({ error: 'Match not found' });
+    }
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto zápasu' });
+    }
+
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    await ensureMatchEvidenceTables();
+
+    await connection.query('DELETE FROM match_pairings WHERE match_id = ?', [matchId]);
+    await connection.query('DELETE FROM match_evidence WHERE match_id = ?', [matchId]);
+    await connection.query('DELETE FROM matches WHERE id = ?', [matchId]);
+
+    await connection.commit();
+    transactionStarted = false;
+
+    return res.json({ message: 'Zápas bol odstránený', matchId });
+  } catch (error) {
+    if (transactionStarted) {
+      await connection.rollback();
+    }
+    next(error);
+  } finally {
+    connection.release();
+  }
+});
+
 // GET /api/matches/:id - Get match detail
 router.get('/:id', authenticateToken, async (req, res, next) => {
   try {
