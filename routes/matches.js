@@ -252,6 +252,173 @@ router.get('/', authenticateToken, async (req, res, next) => {
   }
 });
 
+// POST /api/matches - Create new match
+router.post('/', authenticateToken, async (req, res, next) => {
+  const connection = await db.getConnection();
+  let transactionStarted = false;
+
+  try {
+    const teamId = Number(req.body?.teamId || 0);
+    const opponent = String(req.body?.opponent || '').trim();
+    const matchDate = String(req.body?.matchDate || '').trim();
+    const location = String(req.body?.location || '').trim();
+    const matchType = String(req.body?.matchType || '').trim() || null;
+    const notes = String(req.body?.notes || '').trim() || null;
+    const categoryKey = String(req.body?.categoryKey || '').trim();
+    const selectedPlayers = Array.isArray(req.body?.selectedPlayers) ? req.body.selectedPlayers : [];
+    const indicators = normalizeIndicators(req.body?.indicators);
+
+    const allowedStatuses = new Set(['scheduled', 'ongoing', 'finished', 'cancelled', 'postponed']);
+    const statusCandidate = String(req.body?.status || 'scheduled').trim().toLowerCase();
+    const status = allowedStatuses.has(statusCandidate) ? statusCandidate : 'scheduled';
+
+    const homeScore = req.body?.homeScore === '' || req.body?.homeScore === null || req.body?.homeScore === undefined
+      ? null
+      : Number(req.body.homeScore);
+    const awayScore = req.body?.awayScore === '' || req.body?.awayScore === null || req.body?.awayScore === undefined
+      ? null
+      : Number(req.body.awayScore);
+
+    const scorers = Array.isArray(req.body?.scorers) ? req.body.scorers : [];
+    const assists = Array.isArray(req.body?.assists) ? req.body.assists : [];
+    const cards = Array.isArray(req.body?.cards) ? req.body.cards : [];
+
+    if (!teamId || !opponent || !matchDate) {
+      return res.status(400).json({ error: 'teamId, opponent a matchDate sú povinné' });
+    }
+
+    const scopedTeamIds = await getScopedTeamIds(connection, req.user);
+    if (Array.isArray(scopedTeamIds) && !scopedTeamIds.includes(teamId)) {
+      return res.status(403).json({ error: 'Nemáte prístup k tomuto tímu' });
+    }
+
+    const [teams] = await connection.query(
+      'SELECT id, name, age_group FROM teams WHERE id = ? LIMIT 1',
+      [teamId]
+    );
+
+    if (!teams.length) {
+      return res.status(404).json({ error: 'Tím neexistuje' });
+    }
+
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    const [insertMatchResult] = await connection.query(
+      `INSERT INTO matches (team_id, opponent_team, match_date, location, match_type, home_score, away_score, status, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        teamId,
+        opponent,
+        matchDate,
+        location || null,
+        matchType,
+        Number.isFinite(homeScore) ? homeScore : null,
+        Number.isFinite(awayScore) ? awayScore : null,
+        status,
+        notes,
+      ]
+    );
+
+    const matchId = Number(insertMatchResult?.insertId || 0);
+
+    if (!matchId) {
+      throw new Error('Nepodarilo sa vytvoriť zápas');
+    }
+
+    if (Array.isArray(selectedPlayers) && selectedPlayers.length) {
+      const playerIds = Array.from(new Set(
+        selectedPlayers
+          .map((value) => Number(value))
+          .filter((value) => Number.isInteger(value) && value > 0)
+      ));
+
+      if (playerIds.length) {
+        const [teamMembers] = await connection.query(
+          `SELECT user_id FROM team_memberships
+           WHERE team_id = ? AND is_active = TRUE AND user_id IN (${playerIds.map(() => '?').join(',')})`,
+          [teamId, ...playerIds]
+        );
+
+        const allowedPlayerIds = teamMembers.map((row) => Number(row.user_id)).filter((value) => Number.isInteger(value) && value > 0);
+
+        if (allowedPlayerIds.length) {
+          const lineupValues = allowedPlayerIds.map((userId) => [matchId, userId, 'starting']);
+          await connection.query(
+            `INSERT INTO match_lineup (match_id, user_id, lineup_type)
+             VALUES ?`,
+            [lineupValues]
+          );
+        }
+      }
+    }
+
+    await ensureMatchEvidenceTables();
+
+    await connection.query(
+      `INSERT INTO match_evidence (match_id, home_score, away_score, scorers_json, assists_json, cards_json, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         home_score = VALUES(home_score),
+         away_score = VALUES(away_score),
+         scorers_json = VALUES(scorers_json),
+         assists_json = VALUES(assists_json),
+         cards_json = VALUES(cards_json),
+         updated_by = VALUES(updated_by)`,
+      [
+        matchId,
+        Number.isFinite(homeScore) ? homeScore : null,
+        Number.isFinite(awayScore) ? awayScore : null,
+        JSON.stringify(scorers),
+        JSON.stringify(assists),
+        JSON.stringify(cards),
+        req.user?.id || null,
+      ]
+    );
+
+    if (categoryKey) {
+      await connection.query(
+        `INSERT INTO match_category_settings (team_id, category_key, indicators_json, updated_by)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE indicators_json = VALUES(indicators_json), updated_by = VALUES(updated_by)`,
+        [teamId, categoryKey, JSON.stringify(indicators), req.user?.id || null]
+      );
+    }
+
+    await connection.commit();
+    transactionStarted = false;
+
+    return res.status(201).json({
+      message: 'Zápas bol vytvorený',
+      match: {
+        id: matchId,
+        opponent,
+        matchDate,
+        location: location || null,
+        matchType,
+        homeScore: Number.isFinite(homeScore) ? homeScore : null,
+        awayScore: Number.isFinite(awayScore) ? awayScore : null,
+        result: Number.isFinite(homeScore) && Number.isFinite(awayScore)
+          ? `${homeScore}:${awayScore}`
+          : null,
+        status,
+        team: {
+          id: teams[0].id,
+          name: teams[0].name,
+          ageGroup: teams[0].age_group,
+        },
+      },
+    });
+  } catch (error) {
+    if (transactionStarted) {
+      await connection.rollback();
+    }
+    next(error);
+  } finally {
+    connection.release();
+  }
+});
+
 // GET /api/matches/:id - Get match detail
 router.get('/:id', authenticateToken, async (req, res, next) => {
   try {
