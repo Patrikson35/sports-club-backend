@@ -70,13 +70,21 @@ const ensureMatchEvidenceTables = async () => {
 
 const normalizeIndicators = (value) => {
   const source = value && typeof value === 'object' ? value : {};
-  return {
+  const normalized = {
     result: source.result !== false,
     scorers: source.scorers !== false,
     assists: Boolean(source.assists),
     yellowCards: Boolean(source.yellowCards),
     redCards: Boolean(source.redCards),
   };
+
+  Object.entries(source).forEach(([rawKey, rawValue]) => {
+    const indicatorKey = String(rawKey || '').trim();
+    if (!indicatorKey || Object.prototype.hasOwnProperty.call(normalized, indicatorKey)) return;
+    normalized[indicatorKey] = Boolean(rawValue);
+  });
+
+  return normalized;
 };
 
 const parseJsonSafe = (value, fallback) => {
