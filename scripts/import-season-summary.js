@@ -104,6 +104,54 @@ async function ensureSummaryTable(connection) {
   `);
 }
 
+async function ensureAttendanceSeasonsTable(connection) {
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS attendance_seasons (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      club_id INT NOT NULL,
+      name VARCHAR(120) NOT NULL,
+      from_date VARCHAR(10) NOT NULL,
+      to_date VARCHAR(10) NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_attendance_seasons_club (club_id),
+      INDEX idx_attendance_seasons_name (name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `);
+}
+
+function normalizeSeasonLabel(rawValue) {
+  const matched = String(rawValue || '').trim().match(/^(\d{4})\s*\/\s*(\d{4})$/);
+  if (!matched) return '';
+
+  const startYear = Number(matched[1]);
+  const endYear = Number(matched[2]);
+  if (!Number.isInteger(startYear) || !Number.isInteger(endYear) || endYear !== (startYear + 1)) {
+    return '';
+  }
+
+  return `${startYear}/${endYear}`;
+}
+
+async function ensureImportedSeasonVisible(connection, clubId, seasonLabel) {
+  const normalizedSeason = normalizeSeasonLabel(seasonLabel);
+  if (!normalizedSeason) return;
+
+  await ensureAttendanceSeasonsTable(connection);
+
+  const [existingRows] = await connection.query(
+    'SELECT id FROM attendance_seasons WHERE club_id = ? AND LOWER(name) = LOWER(?) LIMIT 1',
+    [clubId, normalizedSeason]
+  );
+
+  if (Array.isArray(existingRows) && existingRows.length > 0) return;
+
+  await connection.query(
+    'INSERT INTO attendance_seasons (club_id, name, from_date, to_date) VALUES (?, ?, ?, ?)',
+    [clubId, normalizedSeason, '01.07', '30.06']
+  );
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
@@ -241,6 +289,7 @@ async function main() {
     }
 
     await ensureSummaryTable(connection);
+    await ensureImportedSeasonVisible(connection, clubId, args.season);
 
     for (const row of matched) {
       await connection.query(
