@@ -1,0 +1,300 @@
+const path = require('path');
+const XLSX = require('xlsx');
+const mysql = require('mysql2/promise');
+require('dotenv').config();
+
+const NAME_ALIASES = {
+  timotej: 'timko',
+  timo: 'timko',
+  matko: 'matko',
+  misko: 'misko'
+};
+
+function parseArgs(argv) {
+  const args = {
+    file: '',
+    club: 'Stars Academy',
+    sheet: 'CELKOM SEZONA',
+    season: '',
+    apply: false
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === '--file') args.file = String(argv[i + 1] || '');
+    if (token === '--club') args.club = String(argv[i + 1] || '');
+    if (token === '--sheet') args.sheet = String(argv[i + 1] || '');
+    if (token === '--season') args.season = String(argv[i + 1] || '');
+    if (token === '--apply') args.apply = true;
+  }
+
+  return args;
+}
+
+function normalizeText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function normalizeFirstName(value) {
+  const normalized = normalizeText(value);
+  return NAME_ALIASES[normalized] || normalized;
+}
+
+function toPlayerKeyFromFullName(fullName) {
+  const tokens = String(fullName || '').trim().split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return '';
+  const firstName = normalizeFirstName(tokens[0]);
+  const lastName = normalizeText(tokens.slice(1).join(' '));
+  if (!firstName || !lastName) return '';
+  return `${lastName}|${firstName}`;
+}
+
+function toPlayerKeyFromDb(firstName, lastName) {
+  const left = normalizeText(lastName);
+  const right = normalizeFirstName(firstName);
+  if (!left || !right) return '';
+  return `${left}|${right}`;
+}
+
+function toNumberOrNull(value) {
+  const source = String(value ?? '').trim();
+  if (!source) return null;
+  const normalized = source.replace(',', '.');
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isSkippableName(value) {
+  const n = normalizeText(value);
+  return !n || n === '0' || n === 'druzstvo' || n === 'meno' || n === 'jmeno';
+}
+
+async function ensureSummaryTable(connection) {
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS player_season_summaries (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      club_id INT NOT NULL,
+      user_id INT NOT NULL,
+      season VARCHAR(32) NOT NULL,
+      source_file VARCHAR(255) NULL,
+      sheet_name VARCHAR(128) NULL,
+      dz_count INT NULL,
+      dz_minutes INT NULL,
+      tj_count INT NULL,
+      tj_minutes INT NULL,
+      pz_count INT NULL,
+      pz_minutes INT NULL,
+      mz_count INT NULL,
+      mz_minutes INT NULL,
+      rz_minutes INT NULL,
+      hz_minutes INT NULL,
+      hz_percent DECIMAL(8,6) NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_club_user_season (club_id, user_id, season),
+      INDEX idx_summary_club (club_id),
+      INDEX idx_summary_user (user_id),
+      INDEX idx_summary_season (season)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `);
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+
+  if (!args.file) {
+    throw new Error('Missing --file <xlsx_path>');
+  }
+
+  if (!args.season) {
+    throw new Error('Missing --season <value>, for example --season 2024/2025');
+  }
+
+  const workbook = XLSX.readFile(args.file, { cellDates: false });
+  const sheet = workbook.Sheets[args.sheet];
+  if (!sheet) {
+    throw new Error(`Sheet "${args.sheet}" was not found in workbook.`);
+  }
+
+  const rows = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    raw: false,
+    defval: ''
+  });
+
+  const excelRows = [];
+  for (let index = 3; index < rows.length; index += 1) {
+    const row = Array.isArray(rows[index]) ? rows[index] : [];
+    const fullName = String(row[0] || '').trim();
+    if (isSkippableName(fullName)) continue;
+
+    excelRows.push({
+      rowNumber: index + 1,
+      fullName,
+      key: toPlayerKeyFromFullName(fullName),
+      dzCount: toNumberOrNull(row[1]),
+      dzMinutes: toNumberOrNull(row[2]),
+      tjCount: toNumberOrNull(row[3]),
+      tjMinutes: toNumberOrNull(row[4]),
+      pzCount: toNumberOrNull(row[6]),
+      pzMinutes: toNumberOrNull(row[7]),
+      mzCount: toNumberOrNull(row[8]),
+      mzMinutes: toNumberOrNull(row[9]),
+      rzMinutes: toNumberOrNull(row[10]),
+      hzMinutes: toNumberOrNull(row[11]),
+      hzPercent: toNumberOrNull(row[12])
+    });
+  }
+
+  const connection = await mysql.createConnection({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT || 3306,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME
+  });
+
+  try {
+    const [clubs] = await connection.query(
+      'SELECT id, name FROM clubs WHERE LOWER(name) = LOWER(?) ORDER BY id DESC LIMIT 1',
+      [args.club]
+    );
+
+    if (!clubs.length) {
+      throw new Error(`Club "${args.club}" was not found.`);
+    }
+
+    const clubId = Number(clubs[0].id);
+
+    const [players] = await connection.query(
+      `SELECT DISTINCT u.id AS userId, u.first_name AS firstName, u.last_name AS lastName
+       FROM users u
+       JOIN team_memberships tm ON tm.user_id = u.id AND tm.is_active = TRUE
+       JOIN teams t ON t.id = tm.team_id
+       WHERE t.club_id = ?`,
+      [clubId]
+    );
+
+    const playerMap = new Map();
+    players.forEach((player) => {
+      const key = toPlayerKeyFromDb(player.firstName, player.lastName);
+      if (!key) return;
+      if (!playerMap.has(key)) playerMap.set(key, []);
+      playerMap.get(key).push(player);
+    });
+
+    const matched = [];
+    const missing = [];
+    const ambiguous = [];
+
+    excelRows.forEach((entry) => {
+      const candidates = playerMap.get(entry.key) || [];
+      if (candidates.length === 1) {
+        matched.push({
+          ...entry,
+          userId: Number(candidates[0].userId),
+          dbName: `${String(candidates[0].firstName || '').trim()} ${String(candidates[0].lastName || '').trim()}`
+        });
+        return;
+      }
+
+      if (candidates.length > 1) {
+        ambiguous.push({
+          excelName: entry.fullName,
+          candidates: candidates.map((item) => `${item.firstName} ${item.lastName} (#${item.userId})`)
+        });
+        return;
+      }
+
+      missing.push(entry.fullName);
+    });
+
+    const report = {
+      mode: args.apply ? 'apply' : 'dry-run',
+      club: clubs[0].name,
+      clubId,
+      season: args.season,
+      sourceFile: path.basename(args.file),
+      sheet: args.sheet,
+      excelRows: excelRows.length,
+      dbPlayers: players.length,
+      matchedCount: matched.length,
+      missingCount: missing.length,
+      ambiguousCount: ambiguous.length,
+      matched: matched.map((item) => ({
+        excelName: item.fullName,
+        dbName: item.dbName,
+        userId: item.userId
+      })),
+      missing,
+      ambiguous
+    };
+
+    if (!args.apply) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+
+    await ensureSummaryTable(connection);
+
+    for (const row of matched) {
+      await connection.query(
+        `INSERT INTO player_season_summaries (
+          club_id, user_id, season, source_file, sheet_name,
+          dz_count, dz_minutes, tj_count, tj_minutes,
+          pz_count, pz_minutes, mz_count, mz_minutes,
+          rz_minutes, hz_minutes, hz_percent
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          source_file = VALUES(source_file),
+          sheet_name = VALUES(sheet_name),
+          dz_count = VALUES(dz_count),
+          dz_minutes = VALUES(dz_minutes),
+          tj_count = VALUES(tj_count),
+          tj_minutes = VALUES(tj_minutes),
+          pz_count = VALUES(pz_count),
+          pz_minutes = VALUES(pz_minutes),
+          mz_count = VALUES(mz_count),
+          mz_minutes = VALUES(mz_minutes),
+          rz_minutes = VALUES(rz_minutes),
+          hz_minutes = VALUES(hz_minutes),
+          hz_percent = VALUES(hz_percent)`,
+        [
+          clubId,
+          row.userId,
+          args.season,
+          path.basename(args.file),
+          args.sheet,
+          row.dzCount,
+          row.dzMinutes,
+          row.tjCount,
+          row.tjMinutes,
+          row.pzCount,
+          row.pzMinutes,
+          row.mzCount,
+          row.mzMinutes,
+          row.rzMinutes,
+          row.hzMinutes,
+          row.hzPercent
+        ]
+      );
+    }
+
+    console.log(JSON.stringify({
+      ...report,
+      importedCount: matched.length
+    }, null, 2));
+  } finally {
+    await connection.end();
+  }
+}
+
+main().catch((error) => {
+  console.error(error.message || error);
+  process.exit(1);
+});
