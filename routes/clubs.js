@@ -1824,6 +1824,40 @@ const ensurePlayerSeasonSummariesTable = async (connection = db) => {
   `);
 };
 
+const ensurePlayerTimelineSummariesTable = async (connection = db) => {
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS player_timeline_summaries (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      club_id INT NOT NULL,
+      user_id INT NOT NULL,
+      season VARCHAR(32) NOT NULL,
+      timeline_type VARCHAR(16) NOT NULL,
+      timeline_key VARCHAR(64) NOT NULL,
+      timeline_label VARCHAR(120) NULL,
+      month_index TINYINT NULL,
+      source_file VARCHAR(255) NULL,
+      sheet_name VARCHAR(128) NULL,
+      dz_count INT NULL,
+      dz_minutes INT NULL,
+      tj_count INT NULL,
+      tj_minutes INT NULL,
+      pz_count INT NULL,
+      pz_minutes INT NULL,
+      mz_count INT NULL,
+      mz_minutes INT NULL,
+      rz_minutes INT NULL,
+      hz_minutes INT NULL,
+      hz_percent DECIMAL(8,6) NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_club_user_timeline (club_id, user_id, season, timeline_type, timeline_key),
+      INDEX idx_timeline_club (club_id),
+      INDEX idx_timeline_season (season),
+      INDEX idx_timeline_key (timeline_type, timeline_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+};
+
 const normalizeSeasonRow = (row) => ({
   id: row.id,
   name: row.name,
@@ -1942,6 +1976,95 @@ router.get('/my-club/player-season-summaries', authenticateToken, async (req, re
       id: Number(row.id),
       userId: Number(row.user_id),
       season: String(row.season || ''),
+      playerName: `${String(row.first_name || '').trim()} ${String(row.last_name || '').trim()}`.trim(),
+      dzCount: Number(row.dz_count || 0),
+      dzMinutes: Number(row.dz_minutes || 0),
+      tjCount: Number(row.tj_count || 0),
+      tjMinutes: Number(row.tj_minutes || 0),
+      pzCount: Number(row.pz_count || 0),
+      pzMinutes: Number(row.pz_minutes || 0),
+      mzCount: Number(row.mz_count || 0),
+      mzMinutes: Number(row.mz_minutes || 0),
+      rzMinutes: Number(row.rz_minutes || 0),
+      hzMinutes: Number(row.hz_minutes || 0),
+      hzPercent: Number(row.hz_percent || 0),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
+
+    res.json({ total: summaries.length, summaries });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/clubs/my-club/player-timeline-summaries
+router.get('/my-club/player-timeline-summaries', authenticateToken, async (req, res, next) => {
+  try {
+    await ensurePlayerTimelineSummariesTable(db);
+    const clubId = await resolveUserClubId(req.user.id);
+    if (!clubId) return res.status(404).json({ error: 'Klub nebol nájdený' });
+
+    const seasonFilter = String(req.query?.season || '').trim();
+    const timelineTypeFilter = String(req.query?.timelineType || '').trim();
+    const timelineKeyFilter = String(req.query?.timelineKey || '').trim();
+    const params = [clubId];
+    let whereSql = 'WHERE pts.club_id = ?';
+
+    if (seasonFilter) {
+      whereSql += ' AND pts.season = ?';
+      params.push(seasonFilter);
+    }
+
+    if (timelineTypeFilter) {
+      whereSql += ' AND pts.timeline_type = ?';
+      params.push(timelineTypeFilter);
+    }
+
+    if (timelineKeyFilter) {
+      whereSql += ' AND pts.timeline_key = ?';
+      params.push(timelineKeyFilter);
+    }
+
+    const [rows] = await db.query(
+      `SELECT
+         pts.id,
+         pts.user_id,
+         pts.season,
+         pts.timeline_type,
+         pts.timeline_key,
+         pts.timeline_label,
+         pts.month_index,
+         pts.dz_count,
+         pts.dz_minutes,
+         pts.tj_count,
+         pts.tj_minutes,
+         pts.pz_count,
+         pts.pz_minutes,
+         pts.mz_count,
+         pts.mz_minutes,
+         pts.rz_minutes,
+         pts.hz_minutes,
+         pts.hz_percent,
+         pts.created_at,
+         pts.updated_at,
+         u.first_name,
+         u.last_name
+       FROM player_timeline_summaries pts
+       LEFT JOIN users u ON u.id = pts.user_id
+       ${whereSql}
+       ORDER BY pts.season DESC, pts.timeline_type ASC, pts.timeline_key ASC, u.last_name ASC, u.first_name ASC, pts.user_id ASC`,
+      params
+    );
+
+    const summaries = rows.map((row) => ({
+      id: Number(row.id),
+      userId: Number(row.user_id),
+      season: String(row.season || ''),
+      timelineType: String(row.timeline_type || ''),
+      timelineKey: String(row.timeline_key || ''),
+      timelineLabel: String(row.timeline_label || ''),
+      monthIndex: Number.isInteger(Number(row.month_index)) ? Number(row.month_index) : null,
       playerName: `${String(row.first_name || '').trim()} ${String(row.last_name || '').trim()}`.trim(),
       dzCount: Number(row.dz_count || 0),
       dzMinutes: Number(row.dz_minutes || 0),

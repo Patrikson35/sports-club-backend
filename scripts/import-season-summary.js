@@ -16,6 +16,10 @@ function parseArgs(argv) {
     club: 'Stars Academy',
     sheet: 'CELKOM SEZONA',
     season: '',
+    timelineType: 'season',
+    timelineLabel: '',
+    timelineKey: '',
+    month: '',
     apply: false
   };
 
@@ -25,10 +29,68 @@ function parseArgs(argv) {
     if (token === '--club') args.club = String(argv[i + 1] || '');
     if (token === '--sheet') args.sheet = String(argv[i + 1] || '');
     if (token === '--season') args.season = String(argv[i + 1] || '');
+    if (token === '--timeline-type') args.timelineType = String(argv[i + 1] || 'season');
+    if (token === '--timeline-label') args.timelineLabel = String(argv[i + 1] || '');
+    if (token === '--timeline-key') args.timelineKey = String(argv[i + 1] || '');
+    if (token === '--month') args.month = String(argv[i + 1] || '');
     if (token === '--apply') args.apply = true;
   }
 
   return args;
+}
+
+function normalizeTimelineToken(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function resolveTimelineMeta(args) {
+  const normalizedType = String(args.timelineType || 'season').trim().toLowerCase();
+
+  if (normalizedType === 'season') {
+    return {
+      type: 'season',
+      key: String(args.timelineKey || 'summary').trim() || 'summary',
+      label: String(args.timelineLabel || 'Súhrn sezóny').trim() || 'Súhrn sezóny',
+      monthIndex: null
+    };
+  }
+
+  if (normalizedType === 'period') {
+    const label = String(args.timelineLabel || args.sheet || 'Obdobie').trim() || 'Obdobie';
+    const generatedKey = `period-${normalizeTimelineToken(label)}`;
+    return {
+      type: 'period',
+      key: String(args.timelineKey || generatedKey).trim() || generatedKey,
+      label,
+      monthIndex: null
+    };
+  }
+
+  if (normalizedType === 'month') {
+    const monthNumber = Number(args.month);
+    if (!Number.isInteger(monthNumber) || monthNumber < 1 || monthNumber > 12) {
+      throw new Error('For --timeline-type month you must provide --month value from 1 to 12');
+    }
+
+    const zeroBasedMonth = monthNumber - 1;
+    const generatedKey = `month-${zeroBasedMonth}`;
+    const generatedLabel = String(args.timelineLabel || `Mesiac ${monthNumber}`).trim() || `Mesiac ${monthNumber}`;
+
+    return {
+      type: 'month',
+      key: String(args.timelineKey || generatedKey).trim() || generatedKey,
+      label: generatedLabel,
+      monthIndex: zeroBasedMonth
+    };
+  }
+
+  throw new Error('Invalid --timeline-type. Allowed values: season, period, month');
 }
 
 function normalizeText(value) {
@@ -104,6 +166,40 @@ async function ensureSummaryTable(connection) {
   `);
 }
 
+async function ensureTimelineSummaryTable(connection) {
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS player_timeline_summaries (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      club_id INT NOT NULL,
+      user_id INT NOT NULL,
+      season VARCHAR(32) NOT NULL,
+      timeline_type VARCHAR(16) NOT NULL,
+      timeline_key VARCHAR(64) NOT NULL,
+      timeline_label VARCHAR(120) NULL,
+      month_index TINYINT NULL,
+      source_file VARCHAR(255) NULL,
+      sheet_name VARCHAR(128) NULL,
+      dz_count INT NULL,
+      dz_minutes INT NULL,
+      tj_count INT NULL,
+      tj_minutes INT NULL,
+      pz_count INT NULL,
+      pz_minutes INT NULL,
+      mz_count INT NULL,
+      mz_minutes INT NULL,
+      rz_minutes INT NULL,
+      hz_minutes INT NULL,
+      hz_percent DECIMAL(8,6) NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_club_user_timeline (club_id, user_id, season, timeline_type, timeline_key),
+      INDEX idx_timeline_club (club_id),
+      INDEX idx_timeline_season (season),
+      INDEX idx_timeline_key (timeline_type, timeline_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `);
+}
+
 async function ensureAttendanceSeasonsTable(connection) {
   await connection.query(`
     CREATE TABLE IF NOT EXISTS attendance_seasons (
@@ -154,6 +250,7 @@ async function ensureImportedSeasonVisible(connection, clubId, seasonLabel) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const timeline = resolveTimelineMeta(args);
 
   if (!args.file) {
     throw new Error('Missing --file <xlsx_path>');
@@ -267,6 +364,10 @@ async function main() {
       club: clubs[0].name,
       clubId,
       season: args.season,
+      timelineType: timeline.type,
+      timelineKey: timeline.key,
+      timelineLabel: timeline.label,
+      timelineMonthIndex: timeline.monthIndex,
       sourceFile: path.basename(args.file),
       sheet: args.sheet,
       excelRows: excelRows.length,
@@ -289,17 +390,66 @@ async function main() {
     }
 
     await ensureSummaryTable(connection);
-    await ensureImportedSeasonVisible(connection, clubId, args.season);
+    await ensureTimelineSummaryTable(connection);
+    if (timeline.type === 'season') {
+      await ensureImportedSeasonVisible(connection, clubId, args.season);
+    }
 
     for (const row of matched) {
+      if (timeline.type === 'season') {
+        await connection.query(
+          `INSERT INTO player_season_summaries (
+            club_id, user_id, season, source_file, sheet_name,
+            dz_count, dz_minutes, tj_count, tj_minutes,
+            pz_count, pz_minutes, mz_count, mz_minutes,
+            rz_minutes, hz_minutes, hz_percent
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            source_file = VALUES(source_file),
+            sheet_name = VALUES(sheet_name),
+            dz_count = VALUES(dz_count),
+            dz_minutes = VALUES(dz_minutes),
+            tj_count = VALUES(tj_count),
+            tj_minutes = VALUES(tj_minutes),
+            pz_count = VALUES(pz_count),
+            pz_minutes = VALUES(pz_minutes),
+            mz_count = VALUES(mz_count),
+            mz_minutes = VALUES(mz_minutes),
+            rz_minutes = VALUES(rz_minutes),
+            hz_minutes = VALUES(hz_minutes),
+            hz_percent = VALUES(hz_percent)`,
+          [
+            clubId,
+            row.userId,
+            args.season,
+            path.basename(args.file),
+            args.sheet,
+            row.dzCount,
+            row.dzMinutes,
+            row.tjCount,
+            row.tjMinutes,
+            row.pzCount,
+            row.pzMinutes,
+            row.mzCount,
+            row.mzMinutes,
+            row.rzMinutes,
+            row.hzMinutes,
+            row.hzPercent
+          ]
+        );
+      }
+
       await connection.query(
-        `INSERT INTO player_season_summaries (
-          club_id, user_id, season, source_file, sheet_name,
+        `INSERT INTO player_timeline_summaries (
+          club_id, user_id, season, timeline_type, timeline_key, timeline_label, month_index,
+          source_file, sheet_name,
           dz_count, dz_minutes, tj_count, tj_minutes,
           pz_count, pz_minutes, mz_count, mz_minutes,
           rz_minutes, hz_minutes, hz_percent
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
+          timeline_label = VALUES(timeline_label),
+          month_index = VALUES(month_index),
           source_file = VALUES(source_file),
           sheet_name = VALUES(sheet_name),
           dz_count = VALUES(dz_count),
@@ -317,6 +467,10 @@ async function main() {
           clubId,
           row.userId,
           args.season,
+          timeline.type,
+          timeline.key,
+          timeline.label,
+          timeline.monthIndex,
           path.basename(args.file),
           args.sheet,
           row.dzCount,
