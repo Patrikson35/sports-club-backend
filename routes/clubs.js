@@ -1794,6 +1794,36 @@ const ensureAttendanceSeasonsTable = async (connection = db) => {
   `);
 };
 
+const ensurePlayerSeasonSummariesTable = async (connection = db) => {
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS player_season_summaries (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      club_id INT NOT NULL,
+      user_id INT NOT NULL,
+      season VARCHAR(32) NOT NULL,
+      source_file VARCHAR(255) NULL,
+      sheet_name VARCHAR(128) NULL,
+      dz_count INT NULL,
+      dz_minutes INT NULL,
+      tj_count INT NULL,
+      tj_minutes INT NULL,
+      pz_count INT NULL,
+      pz_minutes INT NULL,
+      mz_count INT NULL,
+      mz_minutes INT NULL,
+      rz_minutes INT NULL,
+      hz_minutes INT NULL,
+      hz_percent DECIMAL(8,6) NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_club_user_season (club_id, user_id, season),
+      INDEX idx_summary_club (club_id),
+      INDEX idx_summary_user (user_id),
+      INDEX idx_summary_season (season)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+};
+
 const normalizeSeasonRow = (row) => ({
   id: row.id,
   name: row.name,
@@ -1863,6 +1893,75 @@ router.get('/my-club/attendance-seasons', authenticateToken, async (req, res, ne
     );
     res.json({ total: rows.length, seasons: rows.map(normalizeSeasonRow) });
   } catch (error) { next(error); }
+});
+
+// GET /api/clubs/my-club/player-season-summaries
+router.get('/my-club/player-season-summaries', authenticateToken, async (req, res, next) => {
+  try {
+    await ensurePlayerSeasonSummariesTable(db);
+    const clubId = await resolveUserClubId(req.user.id);
+    if (!clubId) return res.status(404).json({ error: 'Klub nebol nájdený' });
+
+    const seasonFilter = String(req.query?.season || '').trim();
+    const params = [clubId];
+    let whereSql = 'WHERE pss.club_id = ?';
+
+    if (seasonFilter) {
+      whereSql += ' AND pss.season = ?';
+      params.push(seasonFilter);
+    }
+
+    const [rows] = await db.query(
+      `SELECT
+         pss.id,
+         pss.user_id,
+         pss.season,
+         pss.dz_count,
+         pss.dz_minutes,
+         pss.tj_count,
+         pss.tj_minutes,
+         pss.pz_count,
+         pss.pz_minutes,
+         pss.mz_count,
+         pss.mz_minutes,
+         pss.rz_minutes,
+         pss.hz_minutes,
+         pss.hz_percent,
+         pss.created_at,
+         pss.updated_at,
+         u.first_name,
+         u.last_name
+       FROM player_season_summaries pss
+       LEFT JOIN users u ON u.id = pss.user_id
+       ${whereSql}
+       ORDER BY pss.season DESC, u.last_name ASC, u.first_name ASC, pss.user_id ASC`,
+      params
+    );
+
+    const summaries = rows.map((row) => ({
+      id: Number(row.id),
+      userId: Number(row.user_id),
+      season: String(row.season || ''),
+      playerName: `${String(row.first_name || '').trim()} ${String(row.last_name || '').trim()}`.trim(),
+      dzCount: Number(row.dz_count || 0),
+      dzMinutes: Number(row.dz_minutes || 0),
+      tjCount: Number(row.tj_count || 0),
+      tjMinutes: Number(row.tj_minutes || 0),
+      pzCount: Number(row.pz_count || 0),
+      pzMinutes: Number(row.pz_minutes || 0),
+      mzCount: Number(row.mz_count || 0),
+      mzMinutes: Number(row.mz_minutes || 0),
+      rzMinutes: Number(row.rz_minutes || 0),
+      hzMinutes: Number(row.hz_minutes || 0),
+      hzPercent: Number(row.hz_percent || 0),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
+
+    res.json({ total: summaries.length, summaries });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // GET /api/clubs/my-club/training-exercise-display-settings
