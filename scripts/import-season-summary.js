@@ -133,7 +133,95 @@ function toNumberOrNull(value) {
 
 function isSkippableName(value) {
   const n = normalizeText(value);
-  return !n || n === '0' || n === 'druzstvo' || n === 'meno' || n === 'jmeno';
+  return !n || n === '0' || n === 'druzstvo' || n === 'meno' || n === 'jmeno' || n === 'dop.' || n === 'odp.';
+}
+
+function buildHeaderIndexMap(headerRow) {
+  const map = new Map();
+  (Array.isArray(headerRow) ? headerRow : []).forEach((cell, index) => {
+    const normalized = normalizeText(cell);
+    if (!normalized) return;
+    if (!map.has(normalized)) map.set(normalized, index);
+  });
+  return map;
+}
+
+function parseRowsBySheetLayout(rows) {
+  const row2 = Array.isArray(rows?.[1]) ? rows[1] : [];
+  const row4 = Array.isArray(rows?.[3]) ? rows[3] : [];
+
+  const row2HeaderMap = buildHeaderIndexMap(row2);
+  const row4HeaderMap = buildHeaderIndexMap(row4);
+
+  const isLegacySummaryLayout = row2HeaderMap.has('dz/min') && row2HeaderMap.has('tj/min') && row2HeaderMap.has('hz/min');
+  const isMonthlyLayout = row4HeaderMap.has('kd') && row4HeaderMap.has('dz') && row4HeaderMap.has('tj') && row4HeaderMap.has('hz');
+
+  if (isLegacySummaryLayout) {
+    const parsedRows = [];
+    for (let index = 3; index < rows.length; index += 1) {
+      const row = Array.isArray(rows[index]) ? rows[index] : [];
+      const fullName = String(row[0] || '').trim();
+      if (isSkippableName(fullName)) continue;
+
+      parsedRows.push({
+        rowNumber: index + 1,
+        fullName,
+        key: toPlayerKeyFromFullName(fullName),
+        dzCount: toNumberOrNull(row[1]),
+        dzMinutes: toNumberOrNull(row[2]),
+        tjCount: toNumberOrNull(row[3]),
+        tjMinutes: toNumberOrNull(row[4]),
+        pzCount: toNumberOrNull(row[6]),
+        pzMinutes: toNumberOrNull(row[7]),
+        mzCount: toNumberOrNull(row[8]),
+        mzMinutes: toNumberOrNull(row[9]),
+        rzMinutes: toNumberOrNull(row[10]),
+        hzMinutes: toNumberOrNull(row[11]),
+        hzPercent: toNumberOrNull(row[12])
+      });
+    }
+
+    return parsedRows;
+  }
+
+  if (isMonthlyLayout) {
+    const idxDz = row4HeaderMap.get('dz');
+    const idxTj = row4HeaderMap.get('tj');
+    const idxTh = row4HeaderMap.get('th');
+    const idxPocz = row4HeaderMap.get('poc. z');
+    const idxHz = row4HeaderMap.get('hz');
+    const idxRz = row4HeaderMap.get('rz');
+    const idxPercent = row4HeaderMap.get('%');
+
+    const parsedRows = [];
+    for (let index = 6; index < rows.length; index += 1) {
+      const row = Array.isArray(rows[index]) ? rows[index] : [];
+      const fullName = String(row[0] || '').trim();
+      if (isSkippableName(fullName)) continue;
+
+      parsedRows.push({
+        rowNumber: index + 1,
+        fullName,
+        key: toPlayerKeyFromFullName(fullName),
+        dzCount: idxDz >= 0 ? toNumberOrNull(row[idxDz]) : null,
+        dzMinutes: null,
+        tjCount: idxTj >= 0 ? toNumberOrNull(row[idxTj]) : null,
+        tjMinutes: idxTh >= 0 ? toNumberOrNull(row[idxTh]) : null,
+        // Monthly sheets expose Poč. Z as aggregate count, map it to PZ count for POC.Z compatibility.
+        pzCount: idxPocz >= 0 ? toNumberOrNull(row[idxPocz]) : null,
+        pzMinutes: null,
+        mzCount: null,
+        mzMinutes: null,
+        rzMinutes: idxRz >= 0 ? toNumberOrNull(row[idxRz]) : null,
+        hzMinutes: idxHz >= 0 ? toNumberOrNull(row[idxHz]) : null,
+        hzPercent: idxPercent >= 0 ? toNumberOrNull(row[idxPercent]) : null
+      });
+    }
+
+    return parsedRows;
+  }
+
+  throw new Error('Unsupported sheet layout. Expected either summary layout (DZ/min) or monthly layout (KD/DZ/TJ/TH/Poč. Z/HZ).');
 }
 
 async function ensureSummaryTable(connection) {
@@ -272,29 +360,7 @@ async function main() {
     defval: ''
   });
 
-  const excelRows = [];
-  for (let index = 3; index < rows.length; index += 1) {
-    const row = Array.isArray(rows[index]) ? rows[index] : [];
-    const fullName = String(row[0] || '').trim();
-    if (isSkippableName(fullName)) continue;
-
-    excelRows.push({
-      rowNumber: index + 1,
-      fullName,
-      key: toPlayerKeyFromFullName(fullName),
-      dzCount: toNumberOrNull(row[1]),
-      dzMinutes: toNumberOrNull(row[2]),
-      tjCount: toNumberOrNull(row[3]),
-      tjMinutes: toNumberOrNull(row[4]),
-      pzCount: toNumberOrNull(row[6]),
-      pzMinutes: toNumberOrNull(row[7]),
-      mzCount: toNumberOrNull(row[8]),
-      mzMinutes: toNumberOrNull(row[9]),
-      rzMinutes: toNumberOrNull(row[10]),
-      hzMinutes: toNumberOrNull(row[11]),
-      hzPercent: toNumberOrNull(row[12])
-    });
-  }
+  const excelRows = parseRowsBySheetLayout(rows);
 
   const connection = await mysql.createConnection({
     host: process.env.DB_HOST,
