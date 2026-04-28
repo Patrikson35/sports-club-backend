@@ -126,7 +126,10 @@ function toPlayerKeyFromDb(firstName, lastName) {
 function toNumberOrNull(value) {
   const source = String(value ?? '').trim();
   if (!source) return null;
-  const normalized = source.replace(',', '.');
+  const normalized = source
+    .replace(/\s+/g, '')
+    .replace('%', '')
+    .replace(',', '.');
   const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : null;
 }
