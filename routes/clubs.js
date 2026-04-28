@@ -1858,6 +1858,36 @@ const ensurePlayerTimelineSummariesTable = async (connection = db) => {
   `);
 };
 
+const ensurePlayerTimelineDailyEntriesTable = async (connection = db) => {
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS player_timeline_daily_entries (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      club_id INT NOT NULL,
+      user_id INT NOT NULL,
+      season VARCHAR(32) NOT NULL,
+      timeline_type VARCHAR(16) NOT NULL,
+      timeline_key VARCHAR(64) NOT NULL,
+      timeline_label VARCHAR(120) NULL,
+      month_index TINYINT NULL,
+      date_key DATE NOT NULL,
+      day_of_month TINYINT NOT NULL,
+      metric_code VARCHAR(16) NOT NULL,
+      minutes INT NOT NULL,
+      source_file VARCHAR(255) NULL,
+      sheet_name VARCHAR(128) NULL,
+      source_row_index INT NULL,
+      source_column_index INT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_club_user_timeline_day_col (club_id, user_id, season, timeline_type, timeline_key, date_key, source_column_index),
+      INDEX idx_daily_club (club_id),
+      INDEX idx_daily_season (season),
+      INDEX idx_daily_timeline (timeline_type, timeline_key),
+      INDEX idx_daily_date (date_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+};
+
 const normalizeSeasonRow = (row) => ({
   id: row.id,
   name: row.name,
@@ -2082,6 +2112,93 @@ router.get('/my-club/player-timeline-summaries', authenticateToken, async (req, 
     }));
 
     res.json({ total: summaries.length, summaries });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/clubs/my-club/player-timeline-daily-entries
+router.get('/my-club/player-timeline-daily-entries', authenticateToken, async (req, res, next) => {
+  try {
+    await ensurePlayerTimelineDailyEntriesTable(db);
+    const clubId = await resolveUserClubId(req.user.id);
+    if (!clubId) return res.status(404).json({ error: 'Klub nebol nájdený' });
+
+    const seasonFilter = String(req.query?.season || '').trim();
+    const timelineTypeFilter = String(req.query?.timelineType || '').trim();
+    const timelineKeyFilter = String(req.query?.timelineKey || '').trim();
+    const fromDateFilter = String(req.query?.fromDate || '').trim();
+    const toDateFilter = String(req.query?.toDate || '').trim();
+    const params = [clubId];
+    let whereSql = 'WHERE ptd.club_id = ?';
+
+    if (seasonFilter) {
+      whereSql += ' AND ptd.season = ?';
+      params.push(seasonFilter);
+    }
+
+    if (timelineTypeFilter) {
+      whereSql += ' AND ptd.timeline_type = ?';
+      params.push(timelineTypeFilter);
+    }
+
+    if (timelineKeyFilter) {
+      whereSql += ' AND ptd.timeline_key = ?';
+      params.push(timelineKeyFilter);
+    }
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(fromDateFilter)) {
+      whereSql += ' AND ptd.date_key >= ?';
+      params.push(fromDateFilter);
+    }
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(toDateFilter)) {
+      whereSql += ' AND ptd.date_key <= ?';
+      params.push(toDateFilter);
+    }
+
+    const [rows] = await db.query(
+      `SELECT
+         ptd.id,
+         ptd.user_id,
+         ptd.season,
+         ptd.timeline_type,
+         ptd.timeline_key,
+         ptd.timeline_label,
+         ptd.month_index,
+         DATE_FORMAT(ptd.date_key, '%Y-%m-%d') AS date_key,
+         ptd.day_of_month,
+         ptd.metric_code,
+         ptd.minutes,
+         ptd.created_at,
+         ptd.updated_at,
+         u.first_name,
+         u.last_name
+       FROM player_timeline_daily_entries ptd
+       LEFT JOIN users u ON u.id = ptd.user_id
+       ${whereSql}
+       ORDER BY ptd.season DESC, ptd.timeline_type ASC, ptd.timeline_key ASC, ptd.date_key ASC, u.last_name ASC, u.first_name ASC, ptd.source_column_index ASC`,
+      params
+    );
+
+    const entries = rows.map((row) => ({
+      id: Number(row.id),
+      userId: Number(row.user_id),
+      season: String(row.season || ''),
+      timelineType: String(row.timeline_type || ''),
+      timelineKey: String(row.timeline_key || ''),
+      timelineLabel: String(row.timeline_label || ''),
+      monthIndex: Number.isInteger(Number(row.month_index)) ? Number(row.month_index) : null,
+      dateKey: row.date_key ? String(row.date_key).slice(0, 10) : '',
+      dayOfMonth: Number(row.day_of_month || 0),
+      metricCode: String(row.metric_code || '').trim().toUpperCase(),
+      minutes: Number(row.minutes || 0),
+      playerName: `${String(row.first_name || '').trim()} ${String(row.last_name || '').trim()}`.trim(),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
+
+    res.json({ total: entries.length, entries });
   } catch (error) {
     next(error);
   }
