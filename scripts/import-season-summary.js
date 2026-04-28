@@ -189,9 +189,15 @@ function parseRowsBySheetLayout(rows) {
     const idxTj = row4HeaderMap.get('tj');
     const idxTh = row4HeaderMap.get('th');
     const idxPocz = row4HeaderMap.get('poc. z');
+    const idxCz = row4HeaderMap.get('cz');
     const idxHz = row4HeaderMap.get('hz');
     const idxRz = row4HeaderMap.get('rz');
     const idxPercent = row4HeaderMap.get('%');
+
+    const idxPzCount = Number.isInteger(idxPocz) ? idxPocz : -1;
+    const idxMzCount = Number.isInteger(idxPocz) ? idxPocz + 1 : -1;
+    const idxPzMinutes = Number.isInteger(idxCz) ? idxCz : -1;
+    const idxMzMinutes = Number.isInteger(idxCz) ? idxCz + 1 : -1;
 
     const parsedRows = [];
     for (let index = 6; index < rows.length; index += 1) {
@@ -207,11 +213,11 @@ function parseRowsBySheetLayout(rows) {
         dzMinutes: null,
         tjCount: idxTj >= 0 ? toNumberOrNull(row[idxTj]) : null,
         tjMinutes: idxTh >= 0 ? toNumberOrNull(row[idxTh]) : null,
-        // Monthly sheets expose Poč. Z as aggregate count, map it to PZ count for POC.Z compatibility.
-        pzCount: idxPocz >= 0 ? toNumberOrNull(row[idxPocz]) : null,
-        pzMinutes: null,
-        mzCount: null,
-        mzMinutes: null,
+        // Monthly sheets store PZ/MZ split in adjacent cells next to Poč.Z and ČZ.
+        pzCount: idxPzCount >= 0 ? toNumberOrNull(row[idxPzCount]) : null,
+        pzMinutes: idxPzMinutes >= 0 ? toNumberOrNull(row[idxPzMinutes]) : null,
+        mzCount: idxMzCount >= 0 ? toNumberOrNull(row[idxMzCount]) : null,
+        mzMinutes: idxMzMinutes >= 0 ? toNumberOrNull(row[idxMzMinutes]) : null,
         rzMinutes: idxRz >= 0 ? toNumberOrNull(row[idxRz]) : null,
         hzMinutes: idxHz >= 0 ? toNumberOrNull(row[idxHz]) : null,
         hzPercent: idxPercent >= 0 ? toNumberOrNull(row[idxPercent]) : null
