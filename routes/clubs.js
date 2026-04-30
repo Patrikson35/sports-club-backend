@@ -4,6 +4,16 @@ const db = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
+const path = require('path');
+const multer = require('multer');
+const XLSX = require('xlsx');
+
+const attendanceImportUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 25 * 1024 * 1024
+  }
+});
 
 const normalizeSportKey = (value) => {
   const normalized = String(value || '').trim().toLowerCase();
@@ -1888,6 +1898,263 @@ const ensurePlayerTimelineDailyEntriesTable = async (connection = db) => {
   `);
 };
 
+const ATTENDANCE_IMPORT_NAME_ALIASES = {
+  timotej: 'timko',
+  timo: 'timko',
+  matko: 'matko',
+  misko: 'misko'
+};
+
+const ATTENDANCE_IMPORT_MONTH_SHEETS = [
+  { monthNumber: 1, labels: ['januar', 'january'] },
+  { monthNumber: 2, labels: ['februar', 'february'] },
+  { monthNumber: 3, labels: ['marec', 'march'] },
+  { monthNumber: 4, labels: ['april'] },
+  { monthNumber: 5, labels: ['maj', 'may'] },
+  { monthNumber: 6, labels: ['jun', 'june'] },
+  { monthNumber: 7, labels: ['jul', 'july'] },
+  { monthNumber: 8, labels: ['august'] },
+  { monthNumber: 9, labels: ['september'] },
+  { monthNumber: 10, labels: ['oktober', 'october'] },
+  { monthNumber: 11, labels: ['november'] },
+  { monthNumber: 12, labels: ['december'] }
+];
+
+const attendanceImportNormalizeText = (value) => String(value || '')
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase()
+  .trim()
+  .replace(/\s+/g, ' ');
+
+const attendanceImportNormalizeFirstName = (value) => {
+  const normalized = attendanceImportNormalizeText(value);
+  return ATTENDANCE_IMPORT_NAME_ALIASES[normalized] || normalized;
+};
+
+const attendanceImportPlayerKeyFromFullName = (fullName) => {
+  const tokens = String(fullName || '').trim().split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return '';
+  const firstName = attendanceImportNormalizeFirstName(tokens[0]);
+  const lastName = attendanceImportNormalizeText(tokens.slice(1).join(' '));
+  if (!firstName || !lastName) return '';
+  return `${lastName}|${firstName}`;
+};
+
+const attendanceImportPlayerKeyFromDb = (firstName, lastName) => {
+  const left = attendanceImportNormalizeText(lastName);
+  const right = attendanceImportNormalizeFirstName(firstName);
+  if (!left || !right) return '';
+  return `${left}|${right}`;
+};
+
+const attendanceImportToNumberOrNull = (value) => {
+  const source = String(value ?? '').trim();
+  if (!source) return null;
+  const normalized = source
+    .replace(/\s+/g, '')
+    .replace('%', '')
+    .replace(',', '.');
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const attendanceImportToPercentForStorage = (value) => {
+  const numeric = attendanceImportToNumberOrNull(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return numeric > 1 ? (numeric / 100) : numeric;
+};
+
+const attendanceImportIsSkippableName = (value) => {
+  const n = attendanceImportNormalizeText(value);
+  return !n || n === '0' || n === 'druzstvo' || n === 'meno' || n === 'jmeno' || n === 'dop.' || n === 'odp.';
+};
+
+const attendanceImportBuildHeaderIndexMap = (headerRow) => {
+  const map = new Map();
+  (Array.isArray(headerRow) ? headerRow : []).forEach((cell, index) => {
+    const normalized = attendanceImportNormalizeText(cell);
+    if (!normalized || map.has(normalized)) return;
+    map.set(normalized, index);
+  });
+  return map;
+};
+
+const attendanceImportParseSummaryRowsBySheetLayout = (rows) => {
+  const row2 = Array.isArray(rows?.[1]) ? rows[1] : [];
+  const row4 = Array.isArray(rows?.[3]) ? rows[3] : [];
+  const row2HeaderMap = attendanceImportBuildHeaderIndexMap(row2);
+  const row4HeaderMap = attendanceImportBuildHeaderIndexMap(row4);
+
+  const isLegacySummaryLayout = row2HeaderMap.has('dz/min') && row2HeaderMap.has('tj/min') && row2HeaderMap.has('hz/min');
+  const isMonthlyLayout = row4HeaderMap.has('kd') && row4HeaderMap.has('dz') && row4HeaderMap.has('tj') && row4HeaderMap.has('hz');
+
+  if (isLegacySummaryLayout) {
+    const parsedRows = [];
+    for (let index = 3; index < rows.length; index += 1) {
+      const row = Array.isArray(rows[index]) ? rows[index] : [];
+      const fullName = String(row[0] || '').trim();
+      if (attendanceImportIsSkippableName(fullName)) continue;
+
+      parsedRows.push({
+        rowNumber: index + 1,
+        fullName,
+        key: attendanceImportPlayerKeyFromFullName(fullName),
+        dzCount: attendanceImportToNumberOrNull(row[1]),
+        dzMinutes: attendanceImportToNumberOrNull(row[2]),
+        tjCount: attendanceImportToNumberOrNull(row[3]),
+        tjMinutes: attendanceImportToNumberOrNull(row[4]),
+        pzCount: attendanceImportToNumberOrNull(row[6]),
+        pzMinutes: attendanceImportToNumberOrNull(row[7]),
+        mzCount: attendanceImportToNumberOrNull(row[8]),
+        mzMinutes: attendanceImportToNumberOrNull(row[9]),
+        rzMinutes: attendanceImportToNumberOrNull(row[10]),
+        hzMinutes: attendanceImportToNumberOrNull(row[11]),
+        hzPercent: attendanceImportToPercentForStorage(row[12])
+      });
+    }
+    return parsedRows;
+  }
+
+  if (isMonthlyLayout) {
+    const idxDz = row4HeaderMap.get('dz');
+    const idxTj = row4HeaderMap.get('tj');
+    const idxTh = row4HeaderMap.get('th');
+    const idxPocz = row4HeaderMap.get('poc. z');
+    const idxCz = row4HeaderMap.get('cz');
+    const idxHz = row4HeaderMap.get('hz');
+    const idxRz = row4HeaderMap.get('rz');
+    const idxPercent = row4HeaderMap.get('%');
+
+    const idxPzCount = Number.isInteger(idxPocz) ? idxPocz : -1;
+    const idxMzCount = Number.isInteger(idxPocz) ? idxPocz + 1 : -1;
+    const idxPzMinutes = Number.isInteger(idxCz) ? idxCz : -1;
+    const idxMzMinutes = Number.isInteger(idxCz) ? idxCz + 1 : -1;
+
+    const parsedRows = [];
+    for (let index = 6; index < rows.length; index += 1) {
+      const row = Array.isArray(rows[index]) ? rows[index] : [];
+      const fullName = String(row[0] || '').trim();
+      if (attendanceImportIsSkippableName(fullName)) continue;
+
+      parsedRows.push({
+        rowNumber: index + 1,
+        fullName,
+        key: attendanceImportPlayerKeyFromFullName(fullName),
+        dzCount: idxDz >= 0 ? attendanceImportToNumberOrNull(row[idxDz]) : null,
+        dzMinutes: null,
+        tjCount: idxTj >= 0 ? attendanceImportToNumberOrNull(row[idxTj]) : null,
+        tjMinutes: idxTh >= 0 ? attendanceImportToNumberOrNull(row[idxTh]) : null,
+        pzCount: idxPzCount >= 0 ? attendanceImportToNumberOrNull(row[idxPzCount]) : null,
+        pzMinutes: idxPzMinutes >= 0 ? attendanceImportToNumberOrNull(row[idxPzMinutes]) : null,
+        mzCount: idxMzCount >= 0 ? attendanceImportToNumberOrNull(row[idxMzCount]) : null,
+        mzMinutes: idxMzMinutes >= 0 ? attendanceImportToNumberOrNull(row[idxMzMinutes]) : null,
+        rzMinutes: idxRz >= 0 ? attendanceImportToNumberOrNull(row[idxRz]) : null,
+        hzMinutes: idxHz >= 0 ? attendanceImportToNumberOrNull(row[idxHz]) : null,
+        hzPercent: idxPercent >= 0 ? attendanceImportToPercentForStorage(row[idxPercent]) : null
+      });
+    }
+
+    return parsedRows;
+  }
+
+  return [];
+};
+
+const attendanceImportResolveSeasonYears = (seasonLabel) => {
+  const matched = String(seasonLabel || '').trim().match(/^(\d{4})\s*\/\s*(\d{4})$/);
+  if (!matched) return null;
+  const startYear = Number(matched[1]);
+  const endYear = Number(matched[2]);
+  if (!Number.isInteger(startYear) || !Number.isInteger(endYear) || endYear !== (startYear + 1)) return null;
+  return { startYear, endYear };
+};
+
+const attendanceImportResolveYearForMonthIndex = (seasonLabel, monthIndex) => {
+  const years = attendanceImportResolveSeasonYears(seasonLabel);
+  if (!years || !Number.isInteger(monthIndex) || monthIndex < 0 || monthIndex > 11) return null;
+  return monthIndex >= 6 ? years.startYear : years.endYear;
+};
+
+const attendanceImportNormalizeDailyMetricCode = (value) => {
+  const token = attendanceImportNormalizeText(value).toUpperCase();
+  if (!token) return '';
+  if (token.includes('PZ')) return 'PZ';
+  if (token.includes('MZ')) return 'MZ';
+  if (token === 'T' || token.includes('TR')) return 'TJ';
+  return '';
+};
+
+const attendanceImportParseDailyRowsBySheetLayout = (rows, seasonLabel, monthIndex) => {
+  if (!Number.isInteger(monthIndex)) return [];
+
+  const targetYear = attendanceImportResolveYearForMonthIndex(seasonLabel, monthIndex);
+  if (!Number.isInteger(targetYear)) return [];
+
+  const row3 = Array.isArray(rows?.[3]) ? rows[3] : [];
+  const row5 = Array.isArray(rows?.[5]) ? rows[5] : [];
+  const dayColumns = [];
+
+  for (let columnIndex = 0; columnIndex < row5.length; columnIndex += 1) {
+    const dayNumber = Number(String(row5[columnIndex] || '').trim());
+    if (!Number.isInteger(dayNumber) || dayNumber < 1 || dayNumber > 31) continue;
+    const metricCode = attendanceImportNormalizeDailyMetricCode(row3[columnIndex]);
+    if (!metricCode) continue;
+    dayColumns.push({ columnIndex, dayNumber, metricCode });
+  }
+
+  if (dayColumns.length === 0) return [];
+
+  const parsed = [];
+  for (let rowIndex = 6; rowIndex < rows.length; rowIndex += 1) {
+    const row = Array.isArray(rows[rowIndex]) ? rows[rowIndex] : [];
+    const fullName = String(row[0] || '').trim();
+    if (attendanceImportIsSkippableName(fullName)) continue;
+
+    const key = attendanceImportPlayerKeyFromFullName(fullName);
+    if (!key) continue;
+
+    for (const dayColumn of dayColumns) {
+      const minutes = attendanceImportToNumberOrNull(row[dayColumn.columnIndex]);
+      if (!Number.isFinite(minutes) || minutes <= 0) continue;
+
+      parsed.push({
+        fullName,
+        key,
+        rowNumber: rowIndex + 1,
+        sourceColumnIndex: dayColumn.columnIndex,
+        dayNumber: dayColumn.dayNumber,
+        metricCode: dayColumn.metricCode,
+        minutes: Math.round(minutes),
+        dateKey: `${targetYear}-${String(monthIndex + 1).padStart(2, '0')}-${String(dayColumn.dayNumber).padStart(2, '0')}`
+      });
+    }
+  }
+
+  return parsed;
+};
+
+const attendanceImportResolveMonthSheetMeta = (sheetName) => {
+  const normalized = attendanceImportNormalizeText(sheetName);
+  const matched = ATTENDANCE_IMPORT_MONTH_SHEETS.find((item) => item.labels.some((label) => attendanceImportNormalizeText(label) === normalized));
+  if (!matched) return null;
+  const monthIndex = matched.monthNumber - 1;
+  return {
+    timelineType: 'month',
+    timelineKey: `month-${monthIndex}`,
+    timelineLabel: String(sheetName || '').trim() || `Mesiac ${matched.monthNumber}`,
+    monthIndex
+  };
+};
+
+const attendanceImportResolveSeasonSummarySheet = (sheetNames) => {
+  const source = Array.isArray(sheetNames) ? sheetNames : [];
+  return source.find((name) => {
+    const normalized = attendanceImportNormalizeText(name);
+    return normalized.includes('celkom') && normalized.includes('sezona');
+  }) || null;
+};
+
 const normalizeSeasonRow = (row) => ({
   id: row.id,
   name: row.name,
@@ -2201,6 +2468,317 @@ router.get('/my-club/player-timeline-daily-entries', authenticateToken, async (r
     res.json({ total: entries.length, entries });
   } catch (error) {
     next(error);
+  }
+});
+
+// POST /api/clubs/my-club/attendance-import
+router.post('/my-club/attendance-import', authenticateToken, attendanceImportUpload.single('file'), async (req, res, next) => {
+  let connection;
+
+  try {
+    const season = String(req.body?.season || '').trim();
+    if (!/^\d{4}\s*\/\s*\d{4}$/.test(season)) {
+      return res.status(400).json({ error: 'Sezóna musí mať formát RRRR/RRRR.' });
+    }
+
+    if (!req.file?.buffer || !req.file?.originalname) {
+      return res.status(400).json({ error: 'Chýba súbor na import.' });
+    }
+
+    const extension = path.extname(String(req.file.originalname || '')).toLowerCase();
+    if (!['.xlsx', '.xlsm', '.xls'].includes(extension)) {
+      return res.status(400).json({ error: 'Nepodporovaný typ súboru. Povolené: .xlsx, .xlsm, .xls' });
+    }
+
+    const clubId = await resolveUserClubId(req.user.id);
+    if (!clubId) return res.status(404).json({ error: 'Klub nebol nájdený' });
+
+    let workbook;
+    try {
+      workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: false });
+    } catch {
+      return res.status(400).json({ error: 'Súbor sa nepodarilo načítať ako Excel workbook.' });
+    }
+
+    const sourceSheetNames = Array.isArray(workbook.SheetNames) ? workbook.SheetNames : [];
+    const seasonSummarySheet = attendanceImportResolveSeasonSummarySheet(sourceSheetNames);
+    const monthSheets = sourceSheetNames
+      .map((sheetName) => ({ sheetName, timelineMeta: attendanceImportResolveMonthSheetMeta(sheetName) }))
+      .filter((item) => item.timelineMeta);
+
+    if (!seasonSummarySheet && monthSheets.length === 0) {
+      return res.status(400).json({ error: 'V súbore nebol nájdený žiadny podporovaný hárok pre import dochádzky.' });
+    }
+
+    connection = await db.getConnection();
+    await ensurePlayerSeasonSummariesTable(connection);
+    await ensurePlayerTimelineSummariesTable(connection);
+    await ensurePlayerTimelineDailyEntriesTable(connection);
+    await ensureAttendanceSeasonsTable(connection);
+
+    const [players] = await connection.query(
+      `SELECT DISTINCT u.id AS userId, u.first_name AS firstName, u.last_name AS lastName
+       FROM users u
+       JOIN team_memberships tm ON tm.user_id = u.id AND tm.is_active = TRUE
+       JOIN teams t ON t.id = tm.team_id
+       WHERE t.club_id = ?`,
+      [clubId]
+    );
+
+    const playerMap = new Map();
+    players.forEach((player) => {
+      const key = attendanceImportPlayerKeyFromDb(player.firstName, player.lastName);
+      if (!key) return;
+      if (!playerMap.has(key)) playerMap.set(key, []);
+      playerMap.get(key).push(player);
+    });
+
+    const importSheets = [];
+    let totalMatched = 0;
+    let totalDailyImported = 0;
+
+    const upsertSummaryRow = async (timelineMeta, summaryRow, sheetName) => {
+      const summaryValues = [
+        clubId,
+        summaryRow.userId,
+        season,
+        req.file.originalname,
+        sheetName,
+        summaryRow.dzCount,
+        summaryRow.dzMinutes,
+        summaryRow.tjCount,
+        summaryRow.tjMinutes,
+        summaryRow.pzCount,
+        summaryRow.pzMinutes,
+        summaryRow.mzCount,
+        summaryRow.mzMinutes,
+        summaryRow.rzMinutes,
+        summaryRow.hzMinutes,
+        summaryRow.hzPercent
+      ];
+
+      if (timelineMeta.timelineType === 'season') {
+        await connection.query(
+          `INSERT INTO player_season_summaries (
+            club_id, user_id, season, source_file, sheet_name,
+            dz_count, dz_minutes, tj_count, tj_minutes,
+            pz_count, pz_minutes, mz_count, mz_minutes,
+            rz_minutes, hz_minutes, hz_percent
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            source_file = VALUES(source_file),
+            sheet_name = VALUES(sheet_name),
+            dz_count = VALUES(dz_count),
+            dz_minutes = VALUES(dz_minutes),
+            tj_count = VALUES(tj_count),
+            tj_minutes = VALUES(tj_minutes),
+            pz_count = VALUES(pz_count),
+            pz_minutes = VALUES(pz_minutes),
+            mz_count = VALUES(mz_count),
+            mz_minutes = VALUES(mz_minutes),
+            rz_minutes = VALUES(rz_minutes),
+            hz_minutes = VALUES(hz_minutes),
+            hz_percent = VALUES(hz_percent)`,
+          summaryValues
+        );
+      }
+
+      await connection.query(
+        `INSERT INTO player_timeline_summaries (
+          club_id, user_id, season, timeline_type, timeline_key, timeline_label, month_index,
+          source_file, sheet_name,
+          dz_count, dz_minutes, tj_count, tj_minutes,
+          pz_count, pz_minutes, mz_count, mz_minutes,
+          rz_minutes, hz_minutes, hz_percent
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          timeline_label = VALUES(timeline_label),
+          month_index = VALUES(month_index),
+          source_file = VALUES(source_file),
+          sheet_name = VALUES(sheet_name),
+          dz_count = VALUES(dz_count),
+          dz_minutes = VALUES(dz_minutes),
+          tj_count = VALUES(tj_count),
+          tj_minutes = VALUES(tj_minutes),
+          pz_count = VALUES(pz_count),
+          pz_minutes = VALUES(pz_minutes),
+          mz_count = VALUES(mz_count),
+          mz_minutes = VALUES(mz_minutes),
+          rz_minutes = VALUES(rz_minutes),
+          hz_minutes = VALUES(hz_minutes),
+          hz_percent = VALUES(hz_percent)`,
+        [
+          clubId,
+          summaryRow.userId,
+          season,
+          timelineMeta.timelineType,
+          timelineMeta.timelineKey,
+          timelineMeta.timelineLabel,
+          timelineMeta.monthIndex,
+          req.file.originalname,
+          sheetName,
+          summaryRow.dzCount,
+          summaryRow.dzMinutes,
+          summaryRow.tjCount,
+          summaryRow.tjMinutes,
+          summaryRow.pzCount,
+          summaryRow.pzMinutes,
+          summaryRow.mzCount,
+          summaryRow.mzMinutes,
+          summaryRow.rzMinutes,
+          summaryRow.hzMinutes,
+          summaryRow.hzPercent
+        ]
+      );
+    };
+
+    const processSheet = async (sheetName, timelineMeta) => {
+      const sheet = workbook.Sheets[sheetName];
+      if (!sheet) return;
+
+      const rows = XLSX.utils.sheet_to_json(sheet, {
+        header: 1,
+        raw: false,
+        defval: ''
+      });
+
+      const parsedSummaryRows = attendanceImportParseSummaryRowsBySheetLayout(rows);
+      const matchedSummaryRows = [];
+      const missingNames = [];
+
+      parsedSummaryRows.forEach((entry) => {
+        const candidates = playerMap.get(entry.key) || [];
+        if (candidates.length === 1) {
+          matchedSummaryRows.push({
+            ...entry,
+            userId: Number(candidates[0].userId)
+          });
+          return;
+        }
+
+        if (candidates.length === 0) {
+          missingNames.push(entry.fullName);
+        }
+      });
+
+      for (const matchedRow of matchedSummaryRows) {
+        await upsertSummaryRow(timelineMeta, matchedRow, sheetName);
+      }
+
+      let importedDailyCount = 0;
+      if (timelineMeta.timelineType === 'month') {
+        const parsedDailyRows = attendanceImportParseDailyRowsBySheetLayout(rows, season, timelineMeta.monthIndex);
+        const matchedByKey = new Map();
+        matchedSummaryRows.forEach((item) => matchedByKey.set(String(item.key || ''), item));
+
+        const matchedDailyRows = parsedDailyRows
+          .map((entry) => {
+            const resolvedPlayer = matchedByKey.get(String(entry.key || ''));
+            if (!resolvedPlayer) return null;
+            return {
+              ...entry,
+              userId: Number(resolvedPlayer.userId)
+            };
+          })
+          .filter(Boolean);
+
+        await connection.query(
+          `DELETE FROM player_timeline_daily_entries
+           WHERE club_id = ? AND season = ? AND timeline_type = ? AND timeline_key = ?`,
+          [clubId, season, timelineMeta.timelineType, timelineMeta.timelineKey]
+        );
+
+        for (const dailyRow of matchedDailyRows) {
+          await connection.query(
+            `INSERT INTO player_timeline_daily_entries (
+              club_id, user_id, season, timeline_type, timeline_key, timeline_label, month_index,
+              date_key, day_of_month, metric_code, minutes,
+              source_file, sheet_name, source_row_index, source_column_index
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+              timeline_label = VALUES(timeline_label),
+              month_index = VALUES(month_index),
+              metric_code = VALUES(metric_code),
+              minutes = VALUES(minutes),
+              source_file = VALUES(source_file),
+              sheet_name = VALUES(sheet_name),
+              source_row_index = VALUES(source_row_index),
+              source_column_index = VALUES(source_column_index)`,
+            [
+              clubId,
+              dailyRow.userId,
+              season,
+              timelineMeta.timelineType,
+              timelineMeta.timelineKey,
+              timelineMeta.timelineLabel,
+              timelineMeta.monthIndex,
+              dailyRow.dateKey,
+              dailyRow.dayNumber,
+              dailyRow.metricCode,
+              dailyRow.minutes,
+              req.file.originalname,
+              sheetName,
+              dailyRow.rowNumber,
+              dailyRow.sourceColumnIndex
+            ]
+          );
+        }
+
+        importedDailyCount = matchedDailyRows.length;
+        totalDailyImported += importedDailyCount;
+      }
+
+      totalMatched += matchedSummaryRows.length;
+
+      importSheets.push({
+        sheet: sheetName,
+        timelineType: timelineMeta.timelineType,
+        timelineKey: timelineMeta.timelineKey,
+        matchedPlayers: matchedSummaryRows.length,
+        missingPlayers: missingNames.length,
+        importedDailyCount
+      });
+    };
+
+    if (seasonSummarySheet) {
+      await processSheet(seasonSummarySheet, {
+        timelineType: 'season',
+        timelineKey: 'summary',
+        timelineLabel: 'Súhrn sezóny',
+        monthIndex: null
+      });
+
+      const [existingSeasonRows] = await connection.query(
+        'SELECT id FROM attendance_seasons WHERE club_id = ? AND LOWER(name) = LOWER(?) LIMIT 1',
+        [clubId, season]
+      );
+      if (!Array.isArray(existingSeasonRows) || existingSeasonRows.length === 0) {
+        await connection.query(
+          'INSERT INTO attendance_seasons (club_id, name, from_date, to_date) VALUES (?, ?, ?, ?)',
+          [clubId, season, '01.07', '30.06']
+        );
+      }
+    }
+
+    for (const monthSheet of monthSheets) {
+      await processSheet(monthSheet.sheetName, monthSheet.timelineMeta);
+    }
+
+    return res.json({
+      message: 'Import dochádzky bol dokončený.',
+      report: {
+        sheetCount: importSheets.length,
+        totalMatched,
+        totalDailyImported,
+        importedSheets: importSheets
+      }
+    });
+  } catch (error) {
+    return next(error);
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 });
 
