@@ -156,6 +156,56 @@ const resolveTrainingExercisesForeignKeyColumn = async (connection = db) => (
   ])
 );
 
+const ensureTrainingExercisesSchema = async (connection = db) => {
+  const ensureTableExists = async () => {
+    try {
+      await connection.query('SHOW COLUMNS FROM training_exercises');
+      return;
+    } catch (error) {
+      if (error?.code !== 'ER_NO_SUCH_TABLE') {
+        throw error;
+      }
+    }
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS training_exercises (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        training_session_id INT NULL,
+        exercise_id INT NULL,
+        sequence_order INT NULL,
+        duration_minutes INT NULL,
+        notes TEXT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+  };
+
+  const ensureColumn = async (columnName, columnDefinition) => {
+    try {
+      await connection.query(`ALTER TABLE training_exercises ADD COLUMN ${columnName} ${columnDefinition}`);
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  };
+
+  await ensureTableExists();
+
+  await ensureColumn('exercise_id', 'INT NULL');
+  await ensureColumn('sequence_order', 'INT NULL');
+  await ensureColumn('duration_minutes', 'INT NULL');
+  await ensureColumn('notes', 'TEXT NULL');
+
+  let fkColumn = await resolveTrainingExercisesForeignKeyColumn(connection);
+  if (!fkColumn) {
+    await ensureColumn('training_session_id', 'INT NULL');
+    fkColumn = await resolveTrainingExercisesForeignKeyColumn(connection);
+  }
+
+  return fkColumn;
+};
+
 const getParentScopedChildUserIds = async (connection, parentUserId) => {
   const childIds = new Set();
 
@@ -514,7 +564,7 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
       await connection.beginTransaction();
       await ensureTrainingSessionScheduleColumns(connection);
       const dateColumn = await resolveTrainingDateColumn(connection);
-      const trainingExercisesFkColumn = await resolveTrainingExercisesForeignKeyColumn(connection);
+      const trainingExercisesFkColumn = await ensureTrainingExercisesSchema(connection);
       
       // Insert training session
       const [result] = await connection.query(`
