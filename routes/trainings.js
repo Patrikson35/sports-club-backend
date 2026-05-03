@@ -78,13 +78,83 @@ const buildDescriptionWithPlannerMeta = (description, plannerMeta) => {
 
 const resolveTrainingDateColumn = async (connection = db) => {
   const [columns] = await connection.query('SHOW COLUMNS FROM training_sessions');
+  const columnNames = columns.map((column) => String(column?.Field || '').trim());
+  const lowered = new Set(columnNames.map((name) => name.toLowerCase()));
+
+  if (lowered.has('date')) return columnNames.find((name) => name.toLowerCase() === 'date');
+  if (lowered.has('scheduled_date')) return columnNames.find((name) => name.toLowerCase() === 'scheduled_date');
+  if (lowered.has('training_date')) return columnNames.find((name) => name.toLowerCase() === 'training_date');
+  if (lowered.has('session_date')) return columnNames.find((name) => name.toLowerCase() === 'session_date');
+  if (lowered.has('event_date')) return columnNames.find((name) => name.toLowerCase() === 'event_date');
+
+  const dynamicDateColumn = columnNames.find((name) => {
+    const normalized = name.toLowerCase();
+    if (normalized === 'created_at' || normalized === 'updated_at') return false;
+    return normalized.includes('date') || normalized.endsWith('_day') || normalized === 'day';
+  });
+
+  return dynamicDateColumn || 'date';
+};
+
+const ensureTrainingSessionScheduleColumns = async (connection = db) => {
+  const [columns] = await connection.query('SHOW COLUMNS FROM training_sessions');
   const columnSet = new Set(columns.map((column) => String(column?.Field || '').trim().toLowerCase()));
 
-  if (columnSet.has('date')) return 'date';
-  if (columnSet.has('scheduled_date')) return 'scheduled_date';
-  if (columnSet.has('training_date')) return 'training_date';
-  return 'date';
+  const hasDateColumn = ['date', 'scheduled_date', 'training_date', 'session_date', 'event_date']
+    .some((columnName) => columnSet.has(columnName));
+
+  if (!hasDateColumn) {
+    try {
+      await connection.query('ALTER TABLE training_sessions ADD COLUMN training_date DATE NULL');
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  }
+
+  if (!columnSet.has('start_time')) {
+    try {
+      await connection.query('ALTER TABLE training_sessions ADD COLUMN start_time TIME NULL');
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  }
+
+  if (!columnSet.has('end_time')) {
+    try {
+      await connection.query('ALTER TABLE training_sessions ADD COLUMN end_time TIME NULL');
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  }
 };
+
+const resolveExistingColumn = async (connection, tableName, candidateColumns) => {
+  try {
+    const [columns] = await connection.query(`SHOW COLUMNS FROM ${tableName}`);
+    const available = new Set(columns.map((column) => String(column?.Field || '').toLowerCase()));
+    return candidateColumns.find((column) => available.has(String(column).toLowerCase())) || null;
+  } catch (error) {
+    if (error?.code === 'ER_NO_SUCH_TABLE') {
+      return null;
+    }
+    throw error;
+  }
+};
+
+const resolveTrainingExercisesForeignKeyColumn = async (connection = db) => (
+  resolveExistingColumn(connection, 'training_exercises', [
+    'training_session_id',
+    'training_id',
+    'session_id',
+    'trainingId',
+  ])
+);
 
 const getParentScopedChildUserIds = async (connection, parentUserId) => {
   const childIds = new Set();
@@ -173,7 +243,9 @@ const ensureTrainingAccess = async (connection, reqUser, trainingId) => {
 router.get('/', authenticateToken, async (req, res, next) => {
   try {
     const { teamId, status, limit = 50 } = req.query;
+    await ensureTrainingSessionScheduleColumns(db);
     const dateColumn = await resolveTrainingDateColumn(db);
+    const trainingExercisesFkColumn = await resolveTrainingExercisesForeignKeyColumn(db);
     const scopedTeamIds = await getScopedTeamIds(db, req.user);
 
     if (Array.isArray(scopedTeamIds) && scopedTeamIds.length === 0) {
@@ -194,10 +266,18 @@ router.get('/', authenticateToken, async (req, res, next) => {
         ts.location,
         ts.status,
         ts.description,
+        ${trainingExercisesFkColumn ? 'COALESCE(tec.exercise_count, 0)' : '0'} AS exercise_count,
         t.name as team_name,
         t.age_group
       FROM training_sessions ts
       LEFT JOIN teams t ON ts.team_id = t.id
+      ${trainingExercisesFkColumn
+    ? `LEFT JOIN (
+        SELECT ${trainingExercisesFkColumn} AS training_ref_id, COUNT(*) AS exercise_count
+        FROM training_exercises
+        GROUP BY ${trainingExercisesFkColumn}
+      ) tec ON tec.training_ref_id = ts.id`
+    : ''}
       WHERE 1=1
     `;
     
@@ -253,7 +333,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
           ageGroup: tr.age_group
         },
         coach: null,
-        exerciseCount: 0,
+        exerciseCount: Number(tr.exercise_count || 0),
         attendanceCount: 0
       }))
     });
@@ -266,7 +346,9 @@ router.get('/', authenticateToken, async (req, res, next) => {
 router.get('/:id', authenticateToken, async (req, res, next) => {
   try {
     const trainingId = Number(req.params.id);
+    await ensureTrainingSessionScheduleColumns(db);
     const dateColumn = await resolveTrainingDateColumn(db);
+    const trainingExercisesFkColumn = await resolveTrainingExercisesForeignKeyColumn(db);
     const access = await ensureTrainingAccess(db, req.user, trainingId);
     if (access.notFound) {
       return res.status(404).json({ error: 'Training not found' });
@@ -294,22 +376,24 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     const trainingMeta = extractPlannerMetaFromDescription(training.description);
     
     // Get exercises
-    const [exercises] = await db.query(`
-      SELECT 
-        te.id,
-        te.sequence_order,
-        te.duration_minutes,
-        te.notes,
-        e.name,
-        e.description,
-        e.difficulty_level,
-        ec.name as category_name
-      FROM training_exercises te
-      JOIN exercises e ON te.exercise_id = e.id
-      LEFT JOIN exercise_categories ec ON e.category_id = ec.id
-      WHERE te.training_session_id = ?
-      ORDER BY te.sequence_order
-    `, [trainingId]);
+    const [exercises] = trainingExercisesFkColumn
+      ? await db.query(`
+          SELECT 
+            te.id,
+            te.sequence_order,
+            te.duration_minutes,
+            te.notes,
+            e.name,
+            e.description,
+            e.difficulty_level,
+            ec.name as category_name
+          FROM training_exercises te
+          JOIN exercises e ON te.exercise_id = e.id
+          LEFT JOIN exercise_categories ec ON e.category_id = ec.id
+          WHERE te.${trainingExercisesFkColumn} = ?
+          ORDER BY te.sequence_order
+        `, [trainingId])
+      : [[]];
     
     // Get attendance
     const [attendance] = await db.query(`
@@ -391,6 +475,10 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
       name,
       title,
       date, 
+      training_date,
+      scheduled_date,
+      session_date,
+      event_date,
       startTime,
       start_time,
       endTime,
@@ -407,12 +495,13 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
     } = req.body;
 
     const resolvedTitle = title || name;
+    const resolvedDate = date || training_date || scheduled_date || session_date || event_date;
     const resolvedStartTime = startTime || start_time;
     const resolvedEndTime = endTime || end_time;
     const plannerMeta = parsePlannerMetaInput(recurrence_rule || recurrenceRule, session_type || sessionType, indicatorCode);
     const resolvedDescription = buildDescriptionWithPlannerMeta(description || notes || null, plannerMeta);
 
-    if (!teamId || !resolvedTitle || !date || !resolvedStartTime || !resolvedEndTime) {
+    if (!teamId || !resolvedTitle || !resolvedDate || !resolvedStartTime || !resolvedEndTime) {
       return res.status(400).json({
         error: 'Missing required fields',
         required: ['teamId', 'title/name', 'date', 'startTime', 'endTime']
@@ -423,24 +512,30 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
     
     try {
       await connection.beginTransaction();
+      await ensureTrainingSessionScheduleColumns(connection);
       const dateColumn = await resolveTrainingDateColumn(connection);
+      const trainingExercisesFkColumn = await resolveTrainingExercisesForeignKeyColumn(connection);
       
       // Insert training session
       const [result] = await connection.query(`
         INSERT INTO training_sessions 
         (team_id, title, ${dateColumn}, start_time, end_time, location, description, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'planned')
-      `, [teamId, resolvedTitle, date, resolvedStartTime, resolvedEndTime, location || null, resolvedDescription]);
+      `, [teamId, resolvedTitle, resolvedDate, resolvedStartTime, resolvedEndTime, location || null, resolvedDescription]);
       
       const trainingId = result.insertId;
       
       // Insert exercises
       if (exercises.length > 0) {
+        if (!trainingExercisesFkColumn) {
+          throw new Error('Training exercises schema is missing foreign key column');
+        }
+
         for (let i = 0; i < exercises.length; i++) {
           const ex = exercises[i];
           await connection.query(`
             INSERT INTO training_exercises 
-            (training_session_id, exercise_id, sequence_order, duration_minutes, notes)
+            (${trainingExercisesFkColumn}, exercise_id, sequence_order, duration_minutes, notes)
             VALUES (?, ?, ?, ?, ?)
           `, [trainingId, ex.exerciseId, i + 1, ex.duration, ex.notes || null]);
         }
@@ -477,6 +572,10 @@ router.put('/:id', authenticateToken, requireRole(['club', 'coach']), async (req
       name,
       title,
       date,
+      training_date,
+      scheduled_date,
+      session_date,
+      event_date,
       startTime,
       start_time,
       endTime,
@@ -493,6 +592,7 @@ router.put('/:id', authenticateToken, requireRole(['club', 'coach']), async (req
     } = req.body;
 
     const resolvedTitle = title || name;
+    const resolvedDate = date || training_date || scheduled_date || session_date || event_date;
     const resolvedStartTime = startTime || start_time;
     const resolvedEndTime = endTime || end_time;
     const plannerMetaInput = parsePlannerMetaInput(recurrence_rule || recurrenceRule, session_type || sessionType, indicatorCode);
@@ -527,9 +627,9 @@ router.put('/:id', authenticateToken, requireRole(['club', 'coach']), async (req
       updates.push('title = ?');
       params.push(resolvedTitle);
     }
-    if (date !== undefined) {
+    if (resolvedDate !== undefined) {
       updates.push(`${dateColumn} = ?`);
-      params.push(date);
+      params.push(resolvedDate);
     }
     if (resolvedStartTime !== undefined) {
       updates.push('start_time = ?');
@@ -585,20 +685,7 @@ router.delete('/:id', authenticateToken, requireRole(['club', 'coach']), async (
     try {
       await connection.beginTransaction();
 
-      const resolveExistingColumn = async (tableName, candidateColumns) => {
-        try {
-          const [columns] = await connection.query(`SHOW COLUMNS FROM ${tableName}`);
-          const available = new Set(columns.map((column) => String(column?.Field || '').toLowerCase()));
-          return candidateColumns.find((column) => available.has(String(column).toLowerCase())) || null;
-        } catch (error) {
-          if (error?.code === 'ER_NO_SUCH_TABLE') {
-            return null;
-          }
-          throw error;
-        }
-      };
-
-      const trainingExercisesColumn = await resolveExistingColumn('training_exercises', [
+      const trainingExercisesColumn = await resolveExistingColumn(connection, 'training_exercises', [
         'training_session_id',
         'training_id',
         'session_id',
@@ -608,7 +695,7 @@ router.delete('/:id', authenticateToken, requireRole(['club', 'coach']), async (
         await connection.query(`DELETE FROM training_exercises WHERE ${trainingExercisesColumn} = ?`, [trainingId]);
       }
 
-      const attendanceColumn = await resolveExistingColumn('attendance', [
+      const attendanceColumn = await resolveExistingColumn(connection, 'attendance', [
         'training_session_id',
         'training_id',
         'session_id',
@@ -642,6 +729,7 @@ router.delete('/:id', authenticateToken, requireRole(['club', 'coach']), async (
 router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
   try {
     const trainingId = Number(req.params.id);
+    const trainingExercisesFkColumn = await resolveTrainingExercisesForeignKeyColumn(db);
     const access = await ensureTrainingAccess(db, req.user, trainingId);
     if (access.notFound) {
       return res.status(404).json({ error: 'Training not found' });
@@ -650,24 +738,26 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
       return res.status(403).json({ error: 'Nemáte prístup k tomuto tréningu' });
     }
 
-    const [exercises] = await db.query(`
-      SELECT 
-        te.id,
-        te.sequence_order,
-        te.duration_minutes,
-        te.notes,
-        e.id as exercise_id,
-        e.name,
-        e.description,
-        e.difficulty_level,
-        e.required_equipment,
-        ec.name as category_name
-      FROM training_exercises te
-      JOIN exercises e ON te.exercise_id = e.id
-      LEFT JOIN exercise_categories ec ON e.category_id = ec.id
-      WHERE te.training_session_id = ?
-      ORDER BY te.sequence_order
-    `, [trainingId]);
+    const [exercises] = trainingExercisesFkColumn
+      ? await db.query(`
+          SELECT 
+            te.id,
+            te.sequence_order,
+            te.duration_minutes,
+            te.notes,
+            e.id as exercise_id,
+            e.name,
+            e.description,
+            e.difficulty_level,
+            e.required_equipment,
+            ec.name as category_name
+          FROM training_exercises te
+          JOIN exercises e ON te.exercise_id = e.id
+          LEFT JOIN exercise_categories ec ON e.category_id = ec.id
+          WHERE te.${trainingExercisesFkColumn} = ?
+          ORDER BY te.sequence_order
+        `, [trainingId])
+      : [[]];
     
     res.json({
       total: exercises.length,
