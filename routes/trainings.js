@@ -156,6 +156,65 @@ const resolveTrainingExercisesForeignKeyColumn = async (connection = db) => (
   ])
 );
 
+const resolveTrainingExercisesSectionColumn = async (connection = db) => (
+  resolveExistingColumn(connection, 'training_exercises', [
+    'section_id',
+    'section',
+    'sectionId',
+  ])
+);
+
+const resolveTrainingExercisesSectionColumnMeta = async (connection = db) => {
+  const sectionColumn = await resolveTrainingExercisesSectionColumn(connection);
+  if (!sectionColumn) return null;
+
+  try {
+    const [columns] = await connection.query('SHOW COLUMNS FROM training_exercises');
+    const meta = (Array.isArray(columns) ? columns : []).find((column) => (
+      String(column?.Field || '').toLowerCase() === String(sectionColumn).toLowerCase()
+    ));
+
+    if (!meta) return { name: sectionColumn, type: '' };
+    return {
+      name: sectionColumn,
+      type: String(meta?.Type || '').toLowerCase(),
+    };
+  } catch {
+    return { name: sectionColumn, type: '' };
+  }
+};
+
+const resolveTrainingExerciseSectionValue = (exercise, sectionMeta) => {
+  if (!sectionMeta?.name) return null;
+
+  const rawValue = String(
+    exercise?.section
+    || exercise?.section_id
+    || exercise?.sectionId
+    || 'main'
+  ).trim();
+
+  const normalized = rawValue.toLowerCase();
+  const sectionIndexByKey = {
+    warmup: 1,
+    prep: 1,
+    preparation: 1,
+    main: 2,
+    core: 2,
+    end: 3,
+    finish: 3,
+    cool: 3,
+  };
+
+  if (String(sectionMeta.type || '').includes('int')) {
+    const parsed = Number(rawValue);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.trunc(parsed);
+    return sectionIndexByKey[normalized] || 2;
+  }
+
+  return rawValue || 'main';
+};
+
 const ensureTrainingExercisesSchema = async (connection = db) => {
   const ensureTableExists = async () => {
     try {
@@ -196,6 +255,7 @@ const ensureTrainingExercisesSchema = async (connection = db) => {
   await ensureColumn('sequence_order', 'INT NULL');
   await ensureColumn('duration_minutes', 'INT NULL');
   await ensureColumn('notes', 'TEXT NULL');
+  await ensureColumn('section_id', 'VARCHAR(64) NULL');
 
   let fkColumn = await resolveTrainingExercisesForeignKeyColumn(connection);
   if (!fkColumn) {
@@ -566,6 +626,7 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
       await ensureTrainingSessionScheduleColumns(connection);
       const dateColumn = await resolveTrainingDateColumn(connection);
       const trainingExercisesFkColumn = await ensureTrainingExercisesSchema(connection);
+      const trainingExercisesSectionMeta = await resolveTrainingExercisesSectionColumnMeta(connection);
       
       // Insert training session
       const [result] = await connection.query(`
@@ -584,11 +645,20 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
 
         for (let i = 0; i < exercises.length; i++) {
           const ex = exercises[i];
+          const insertColumns = [trainingExercisesFkColumn, 'exercise_id', 'sequence_order', 'duration_minutes', 'notes'];
+          const insertValues = [trainingId, ex.exerciseId, i + 1, ex.duration, ex.notes || null];
+
+          if (trainingExercisesSectionMeta?.name) {
+            insertColumns.push(trainingExercisesSectionMeta.name);
+            insertValues.push(resolveTrainingExerciseSectionValue(ex, trainingExercisesSectionMeta));
+          }
+
+          const placeholders = insertColumns.map(() => '?').join(', ');
           await connection.query(`
             INSERT INTO training_exercises 
-            (${trainingExercisesFkColumn}, exercise_id, sequence_order, duration_minutes, notes)
-            VALUES (?, ?, ?, ?, ?)
-          `, [trainingId, ex.exerciseId, i + 1, ex.duration, ex.notes || null]);
+            (${insertColumns.join(', ')})
+            VALUES (${placeholders})
+          `, insertValues);
         }
       }
       
