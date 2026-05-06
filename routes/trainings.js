@@ -489,6 +489,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
       } : null,
       exercises: exercises.map(ex => ({
         id: ex.id,
+        exerciseId: ex.exercise_id,
         name: ex.name,
         description: ex.description,
         category: ex.category_name,
