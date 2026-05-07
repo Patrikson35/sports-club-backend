@@ -192,6 +192,222 @@ const resolveExercisesNameColumn = async (connection = db) => (
   ])
 );
 
+const resolveTeamClubId = async (connection, teamId) => {
+  const parsedTeamId = Number(teamId);
+  if (!Number.isFinite(parsedTeamId) || parsedTeamId <= 0) return null;
+
+  const teamClubColumn = await resolveExistingColumn(connection, 'teams', ['club_id', 'clubId']);
+  if (!teamClubColumn) return null;
+
+  const [rows] = await connection.query(
+    `SELECT ${teamClubColumn} AS club_id FROM teams WHERE id = ? LIMIT 1`,
+    [Math.trunc(parsedTeamId)]
+  );
+
+  const resolvedClubId = Number(rows?.[0]?.club_id);
+  return Number.isFinite(resolvedClubId) && resolvedClubId > 0 ? Math.trunc(resolvedClubId) : null;
+};
+
+const parseFirstEnumValue = (columnType) => {
+  const source = String(columnType || '').trim();
+  const enumMatch = source.match(/^enum\((.*)\)$/i);
+  if (!enumMatch) return null;
+
+  const firstToken = String(enumMatch[1] || '').split(',')[0] || '';
+  return firstToken.replace(/^\s*'/, '').replace(/'\s*$/, '').trim() || null;
+};
+
+const normalizeExerciseDifficultyValue = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return 'intermediate';
+
+  if (['beginner', 'zaciatocnik', 'začiatočník', 'easy', 'low'].includes(normalized)) return 'beginner';
+  if (['advanced', 'pokrocily', 'pokročilý', 'hard', 'high'].includes(normalized)) return 'advanced';
+  return 'intermediate';
+};
+
+const buildFallbackValueForRequiredExerciseColumn = ({
+  columnName,
+  columnType,
+  fallbackName,
+  reqUser,
+  resolvedClubId,
+  exercisePayload,
+}) => {
+  const normalizedColumnName = String(columnName || '').toLowerCase();
+  const normalizedColumnType = String(columnType || '').toLowerCase();
+
+  if (normalizedColumnName.includes('title') || normalizedColumnName === 'name' || normalizedColumnName.endsWith('_name')) {
+    return fallbackName;
+  }
+
+  if (normalizedColumnName.includes('description') || normalizedColumnName.includes('note')) {
+    return String(exercisePayload?.description || exercisePayload?.notes || 'Auto-created training exercise').trim();
+  }
+
+  if (normalizedColumnName.includes('difficulty')) {
+    return normalizeExerciseDifficultyValue(exercisePayload?.difficulty);
+  }
+
+  if (normalizedColumnName === 'club_id') {
+    return resolvedClubId;
+  }
+
+  if (normalizedColumnName === 'created_by' || normalizedColumnName === 'created_by_user_id' || normalizedColumnName === 'user_id') {
+    const userId = Number(reqUser?.id);
+    return Number.isFinite(userId) && userId > 0 ? Math.trunc(userId) : null;
+  }
+
+  if (normalizedColumnName === 'is_system' || normalizedColumnName === 'is_public') {
+    return 0;
+  }
+
+  if (normalizedColumnName === 'is_active') {
+    return 1;
+  }
+
+  if (normalizedColumnName === 'custom_labels_json') {
+    return '[]';
+  }
+
+  if (normalizedColumnName === 'sport_key') {
+    return 'general';
+  }
+
+  if (normalizedColumnType.includes('int') || normalizedColumnType.includes('decimal') || normalizedColumnType.includes('float') || normalizedColumnType.includes('double')) {
+    return 0;
+  }
+
+  if (normalizedColumnType.includes('tinyint(1)') || normalizedColumnType === 'boolean' || normalizedColumnType === 'bool') {
+    return 0;
+  }
+
+  if (normalizedColumnType.startsWith('enum(')) {
+    return parseFirstEnumValue(normalizedColumnType);
+  }
+
+  if (normalizedColumnType.includes('char') || normalizedColumnType.includes('text')) {
+    return '';
+  }
+
+  return null;
+};
+
+const createFallbackExerciseRecord = async (connection, exercisePayload, options = {}) => {
+  const fallbackName = String(
+    exercisePayload?.title
+    || exercisePayload?.name
+    || ''
+  ).trim();
+
+  if (!fallbackName) return null;
+
+  const exerciseNameColumn = await resolveExercisesNameColumn(connection);
+  if (!exerciseNameColumn) return null;
+
+  let columnsMeta;
+  try {
+    const [columns] = await connection.query('SHOW COLUMNS FROM exercises');
+    columnsMeta = Array.isArray(columns) ? columns : [];
+  } catch (error) {
+    if (error?.code === 'ER_NO_SUCH_TABLE') {
+      return null;
+    }
+    throw error;
+  }
+
+  if (!columnsMeta.length) return null;
+
+  const reqUser = options?.reqUser || null;
+  const userClubId = Number(reqUser?.club_id || reqUser?.clubId || reqUser?.clubID);
+  const teamClubId = await resolveTeamClubId(connection, options?.teamId);
+  const resolvedClubId = Number.isFinite(userClubId) && userClubId > 0
+    ? Math.trunc(userClubId)
+    : (Number.isFinite(teamClubId) && teamClubId > 0 ? Math.trunc(teamClubId) : null);
+
+  const row = {
+    [exerciseNameColumn]: fallbackName,
+  };
+
+  const availableColumnSet = new Set(columnsMeta.map((column) => String(column?.Field || '').toLowerCase()));
+  const setIfColumnExists = (columnName, valueFactory) => {
+    if (!availableColumnSet.has(String(columnName).toLowerCase())) return;
+    if (row[columnName] !== undefined) return;
+    const nextValue = typeof valueFactory === 'function' ? valueFactory() : valueFactory;
+    if (nextValue !== undefined) {
+      row[columnName] = nextValue;
+    }
+  };
+
+  setIfColumnExists('description', () => String(exercisePayload?.description || exercisePayload?.notes || '').trim() || null);
+  setIfColumnExists('duration_minutes', () => {
+    const parsedDuration = Number(exercisePayload?.duration);
+    return Number.isFinite(parsedDuration) && parsedDuration > 0 ? Math.trunc(parsedDuration) : null;
+  });
+  setIfColumnExists('difficulty', () => normalizeExerciseDifficultyValue(exercisePayload?.difficulty));
+  setIfColumnExists('difficulty_level', () => normalizeExerciseDifficultyValue(exercisePayload?.difficulty));
+  setIfColumnExists('equipment_needed', () => String(exercisePayload?.equipment || '').trim() || null);
+  setIfColumnExists('required_equipment', () => String(exercisePayload?.equipment || '').trim() || null);
+  setIfColumnExists('created_by_user_id', () => {
+    const userId = Number(reqUser?.id);
+    return Number.isFinite(userId) && userId > 0 ? Math.trunc(userId) : null;
+  });
+  setIfColumnExists('created_by', () => {
+    const userId = Number(reqUser?.id);
+    return Number.isFinite(userId) && userId > 0 ? Math.trunc(userId) : null;
+  });
+  setIfColumnExists('user_id', () => {
+    const userId = Number(reqUser?.id);
+    return Number.isFinite(userId) && userId > 0 ? Math.trunc(userId) : null;
+  });
+  setIfColumnExists('club_id', () => resolvedClubId);
+  setIfColumnExists('is_system', 0);
+  setIfColumnExists('is_public', 0);
+  setIfColumnExists('is_active', 1);
+  setIfColumnExists('sport_key', 'general');
+  setIfColumnExists('custom_labels_json', '[]');
+
+  for (const column of columnsMeta) {
+    const columnName = String(column?.Field || '');
+    const normalizedColumnName = columnName.toLowerCase();
+    const isAutoIncrement = String(column?.Extra || '').toLowerCase().includes('auto_increment');
+    const isNullable = String(column?.Null || '').toUpperCase() === 'YES';
+    const hasDefault = column?.Default !== null && column?.Default !== undefined;
+
+    if (!columnName || isAutoIncrement) continue;
+    if (row[columnName] !== undefined) continue;
+    if (isNullable || hasDefault) continue;
+
+    const fallbackValue = buildFallbackValueForRequiredExerciseColumn({
+      columnName,
+      columnType: column?.Type,
+      fallbackName,
+      reqUser,
+      resolvedClubId,
+      exercisePayload,
+    });
+
+    if (fallbackValue === null || fallbackValue === undefined) {
+      return null;
+    }
+
+    row[columnName] = fallbackValue;
+  }
+
+  const insertColumns = Object.keys(row);
+  if (!insertColumns.length) return null;
+
+  const placeholders = insertColumns.map(() => '?').join(', ');
+  const insertValues = insertColumns.map((columnName) => row[columnName]);
+  const [result] = await connection.query(
+    `INSERT INTO exercises (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+    insertValues
+  );
+
+  const insertedId = Number(result?.insertId);
+  return Number.isFinite(insertedId) && insertedId > 0 ? insertedId : null;
+};
+
 const resolveTrainingExerciseSectionValue = (exercise, sectionMeta) => {
   if (!sectionMeta?.name) return null;
 
@@ -223,7 +439,7 @@ const resolveTrainingExerciseSectionValue = (exercise, sectionMeta) => {
   return rawValue || 'main';
 };
 
-const resolvePersistedExerciseId = async (connection, exercisePayload) => {
+const resolvePersistedExerciseId = async (connection, exercisePayload, options = {}) => {
   const rawExerciseId = String(exercisePayload?.exerciseId || '').trim();
   const parsedExerciseId = Number(rawExerciseId);
 
@@ -255,6 +471,11 @@ const resolvePersistedExerciseId = async (connection, exercisePayload) => {
 
   if (Array.isArray(matchedByName) && matchedByName.length > 0) {
     return Number(matchedByName[0].id);
+  }
+
+  const autoCreatedExerciseId = await createFallbackExerciseRecord(connection, exercisePayload, options);
+  if (Number.isFinite(autoCreatedExerciseId) && autoCreatedExerciseId > 0) {
+    return Number(autoCreatedExerciseId);
   }
 
   return null;
@@ -531,6 +752,8 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     const trainingMeta = extractPlannerMetaFromDescription(training.description);
     
     // Get exercises
+    const exerciseNameColumn = await resolveExercisesNameColumn(db);
+
     const [exercises] = trainingExercisesFkColumn
       ? await db.query(`
           SELECT 
@@ -538,7 +761,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
             te.sequence_order,
             te.duration_minutes,
             te.notes,
-            e.name,
+            ${exerciseNameColumn ? `e.${exerciseNameColumn} AS exercise_name` : 'NULL AS exercise_name'},
             e.description,
             e.difficulty_level,
             ec.name as category_name
@@ -595,7 +818,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
       exercises: exercises.map(ex => ({
         id: ex.id,
         exerciseId: ex.exercise_id,
-        name: ex.name,
+        name: ex.exercise_name,
         description: ex.description,
         category: ex.category_name,
         difficulty: ex.difficulty_level,
@@ -690,11 +913,18 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
 
         for (let i = 0; i < exercises.length; i++) {
           const ex = exercises[i];
-          const persistedExerciseId = await resolvePersistedExerciseId(connection, ex);
+          const persistedExerciseId = await resolvePersistedExerciseId(connection, ex, {
+            reqUser: req.user,
+            teamId,
+          });
           if (!persistedExerciseId) {
             const exerciseLabel = String(ex?.title || ex?.name || `#${i + 1}`).trim();
             return res.status(400).json({
-              error: `Invalid reference - related record not found (${exerciseLabel})`
+              error: `Invalid reference - related record not found (${exerciseLabel})`,
+              details: {
+                exerciseLabel,
+                requestedExerciseId: ex?.exerciseId || null,
+              }
             });
           }
 
@@ -912,6 +1142,8 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
       return res.status(403).json({ error: 'Nemáte prístup k tomuto tréningu' });
     }
 
+    const exerciseNameColumn = await resolveExercisesNameColumn(db);
+
     const [exercises] = trainingExercisesFkColumn
       ? await db.query(`
           SELECT 
@@ -920,7 +1152,7 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
             te.duration_minutes,
             te.notes,
             e.id as exercise_id,
-            e.name,
+            ${exerciseNameColumn ? `e.${exerciseNameColumn} AS exercise_name` : 'NULL AS exercise_name'},
             e.description,
             e.difficulty_level,
             e.required_equipment,
@@ -938,7 +1170,7 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
       exercises: exercises.map(ex => ({
         id: ex.id,
         exerciseId: ex.exercise_id,
-        name: ex.name,
+        name: ex.exercise_name,
         description: ex.description,
         category: ex.category_name,
         difficulty: ex.difficulty_level,
