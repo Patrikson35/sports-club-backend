@@ -215,6 +215,40 @@ const resolveTrainingExerciseSectionValue = (exercise, sectionMeta) => {
   return rawValue || 'main';
 };
 
+const resolvePersistedExerciseId = async (connection, exercisePayload) => {
+  const rawExerciseId = String(exercisePayload?.exerciseId || '').trim();
+  const parsedExerciseId = Number(rawExerciseId);
+
+  if (Number.isFinite(parsedExerciseId) && parsedExerciseId > 0) {
+    const [rows] = await connection.query(
+      'SELECT id FROM exercises WHERE id = ? LIMIT 1',
+      [Math.trunc(parsedExerciseId)]
+    );
+    if (Array.isArray(rows) && rows.length > 0) {
+      return Number(rows[0].id);
+    }
+  }
+
+  const fallbackName = String(
+    exercisePayload?.title
+    || exercisePayload?.name
+    || ''
+  ).trim();
+
+  if (!fallbackName) return null;
+
+  const [matchedByName] = await connection.query(
+    'SELECT id FROM exercises WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1',
+    [fallbackName]
+  );
+
+  if (Array.isArray(matchedByName) && matchedByName.length > 0) {
+    return Number(matchedByName[0].id);
+  }
+
+  return null;
+};
+
 const ensureTrainingExercisesSchema = async (connection = db) => {
   const ensureTableExists = async () => {
     try {
@@ -645,8 +679,16 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
 
         for (let i = 0; i < exercises.length; i++) {
           const ex = exercises[i];
+          const persistedExerciseId = await resolvePersistedExerciseId(connection, ex);
+          if (!persistedExerciseId) {
+            const exerciseLabel = String(ex?.title || ex?.name || `#${i + 1}`).trim();
+            return res.status(400).json({
+              error: `Invalid reference - related record not found (${exerciseLabel})`
+            });
+          }
+
           const insertColumns = [trainingExercisesFkColumn, 'exercise_id', 'sequence_order', 'duration_minutes', 'notes'];
-          const insertValues = [trainingId, ex.exerciseId, i + 1, ex.duration, ex.notes || null];
+          const insertValues = [trainingId, persistedExerciseId, i + 1, ex.duration, ex.notes || null];
 
           if (trainingExercisesSectionMeta?.name) {
             insertColumns.push(trainingExercisesSectionMeta.name);
