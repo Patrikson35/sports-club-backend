@@ -184,6 +184,14 @@ const resolveTrainingExercisesSectionColumnMeta = async (connection = db) => {
   }
 };
 
+const resolveExercisesNameColumn = async (connection = db) => (
+  resolveExistingColumn(connection, 'exercises', [
+    'name',
+    'title',
+    'exercise_name',
+  ])
+);
+
 const resolveTrainingExerciseSectionValue = (exercise, sectionMeta) => {
   if (!sectionMeta?.name) return null;
 
@@ -237,8 +245,11 @@ const resolvePersistedExerciseId = async (connection, exercisePayload) => {
 
   if (!fallbackName) return null;
 
+  const exerciseNameColumn = await resolveExercisesNameColumn(connection);
+  if (!exerciseNameColumn) return null;
+
   const [matchedByName] = await connection.query(
-    'SELECT id FROM exercises WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1',
+    `SELECT id FROM exercises WHERE LOWER(TRIM(${exerciseNameColumn})) = LOWER(TRIM(?)) LIMIT 1`,
     [fallbackName]
   );
 
