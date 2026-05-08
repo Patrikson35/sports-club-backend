@@ -208,6 +208,43 @@ const resolveTeamClubId = async (connection, teamId) => {
   return Number.isFinite(resolvedClubId) && resolvedClubId > 0 ? Math.trunc(resolvedClubId) : null;
 };
 
+const isSafeIdentifier = (value) => /^[A-Za-z0-9_]+$/.test(String(value || ''));
+
+const quoteIdentifier = (value) => `\`${String(value)}\``;
+
+const resolveReferencedFallbackId = async (connection, tableName, columnName) => {
+  const safeTableName = String(tableName || '').trim();
+  const safeColumnName = String(columnName || '').trim();
+  if (!safeTableName || !safeColumnName) return null;
+
+  const [rows] = await connection.query(
+    `SELECT REFERENCED_TABLE_NAME AS referencedTableName, REFERENCED_COLUMN_NAME AS referencedColumnName
+     FROM information_schema.KEY_COLUMN_USAGE
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = ?
+       AND COLUMN_NAME = ?
+       AND REFERENCED_TABLE_NAME IS NOT NULL
+     LIMIT 1`,
+    [safeTableName, safeColumnName]
+  );
+
+  const referencedTableName = String(rows?.[0]?.referencedTableName || '').trim();
+  const referencedColumnName = String(rows?.[0]?.referencedColumnName || '').trim();
+
+  if (!referencedTableName || !referencedColumnName) return null;
+  if (!isSafeIdentifier(referencedTableName) || !isSafeIdentifier(referencedColumnName)) return null;
+
+  const [refRows] = await connection.query(
+    `SELECT ${quoteIdentifier(referencedColumnName)} AS ref_id
+     FROM ${quoteIdentifier(referencedTableName)}
+     ORDER BY ${quoteIdentifier(referencedColumnName)} ASC
+     LIMIT 1`
+  );
+
+  const refId = Number(refRows?.[0]?.ref_id);
+  return Number.isFinite(refId) && refId > 0 ? Math.trunc(refId) : null;
+};
+
 const parseFirstEnumValue = (columnType) => {
   const source = String(columnType || '').trim();
   const enumMatch = source.match(/^enum\((.*)\)$/i);
@@ -233,6 +270,7 @@ const buildFallbackValueForRequiredExerciseColumn = ({
   reqUser,
   resolvedClubId,
   exercisePayload,
+  referencedFallbackId,
 }) => {
   const normalizedColumnName = String(columnName || '').toLowerCase();
   const normalizedColumnType = String(columnType || '').toLowerCase();
@@ -253,9 +291,18 @@ const buildFallbackValueForRequiredExerciseColumn = ({
     return resolvedClubId;
   }
 
+  if (normalizedColumnName === 'category_id') {
+    return referencedFallbackId;
+  }
+
   if (normalizedColumnName === 'created_by' || normalizedColumnName === 'created_by_user_id' || normalizedColumnName === 'user_id') {
     const userId = Number(reqUser?.id);
-    return Number.isFinite(userId) && userId > 0 ? Math.trunc(userId) : null;
+    if (Number.isFinite(userId) && userId > 0) return Math.trunc(userId);
+    return referencedFallbackId;
+  }
+
+  if (normalizedColumnName.endsWith('_id')) {
+    return referencedFallbackId;
   }
 
   if (normalizedColumnName === 'is_system' || normalizedColumnName === 'is_public') {
@@ -330,6 +377,24 @@ const createFallbackExerciseRecord = async (connection, exercisePayload, options
   };
 
   const availableColumnSet = new Set(columnsMeta.map((column) => String(column?.Field || '').toLowerCase()));
+  const referencedIdCache = new Map();
+
+  const getReferencedFallbackIdCached = async (columnName) => {
+    const cacheKey = String(columnName || '').toLowerCase();
+    if (referencedIdCache.has(cacheKey)) {
+      return referencedIdCache.get(cacheKey);
+    }
+
+    try {
+      const fallbackId = await resolveReferencedFallbackId(connection, 'exercises', columnName);
+      referencedIdCache.set(cacheKey, fallbackId);
+      return fallbackId;
+    } catch {
+      referencedIdCache.set(cacheKey, null);
+      return null;
+    }
+  };
+
   const setIfColumnExists = (columnName, valueFactory) => {
     if (!availableColumnSet.has(String(columnName).toLowerCase())) return;
     if (row[columnName] !== undefined) return;
@@ -367,6 +432,13 @@ const createFallbackExerciseRecord = async (connection, exercisePayload, options
   setIfColumnExists('sport_key', 'general');
   setIfColumnExists('custom_labels_json', '[]');
 
+  if (availableColumnSet.has('category_id')) {
+    const categoryFallbackId = await getReferencedFallbackIdCached('category_id');
+    if (categoryFallbackId) {
+      setIfColumnExists('category_id', () => categoryFallbackId);
+    }
+  }
+
   for (const column of columnsMeta) {
     const columnName = String(column?.Field || '');
     const normalizedColumnName = columnName.toLowerCase();
@@ -378,6 +450,8 @@ const createFallbackExerciseRecord = async (connection, exercisePayload, options
     if (row[columnName] !== undefined) continue;
     if (isNullable || hasDefault) continue;
 
+    const referencedFallbackId = await getReferencedFallbackIdCached(columnName);
+
     const fallbackValue = buildFallbackValueForRequiredExerciseColumn({
       columnName,
       columnType: column?.Type,
@@ -385,6 +459,7 @@ const createFallbackExerciseRecord = async (connection, exercisePayload, options
       reqUser,
       resolvedClubId,
       exercisePayload,
+      referencedFallbackId,
     });
 
     if (fallbackValue === null || fallbackValue === undefined) {
@@ -399,8 +474,9 @@ const createFallbackExerciseRecord = async (connection, exercisePayload, options
 
   const placeholders = insertColumns.map(() => '?').join(', ');
   const insertValues = insertColumns.map((columnName) => row[columnName]);
+  const insertColumnsSql = insertColumns.map((columnName) => quoteIdentifier(columnName)).join(', ');
   const [result] = await connection.query(
-    `INSERT INTO exercises (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+    `INSERT INTO exercises (${insertColumnsSql}) VALUES (${placeholders})`,
     insertValues
   );
 
@@ -465,7 +541,7 @@ const resolvePersistedExerciseId = async (connection, exercisePayload, options =
   if (!exerciseNameColumn) return null;
 
   const [matchedByName] = await connection.query(
-    `SELECT id FROM exercises WHERE LOWER(TRIM(${exerciseNameColumn})) = LOWER(TRIM(?)) LIMIT 1`,
+    `SELECT id FROM exercises WHERE LOWER(TRIM(${quoteIdentifier(exerciseNameColumn)})) = LOWER(TRIM(?)) LIMIT 1`,
     [fallbackName]
   );
 
@@ -473,7 +549,12 @@ const resolvePersistedExerciseId = async (connection, exercisePayload, options =
     return Number(matchedByName[0].id);
   }
 
-  const autoCreatedExerciseId = await createFallbackExerciseRecord(connection, exercisePayload, options);
+  let autoCreatedExerciseId = null;
+  try {
+    autoCreatedExerciseId = await createFallbackExerciseRecord(connection, exercisePayload, options);
+  } catch {
+    autoCreatedExerciseId = null;
+  }
   if (Number.isFinite(autoCreatedExerciseId) && autoCreatedExerciseId > 0) {
     return Number(autoCreatedExerciseId);
   }
@@ -919,13 +1000,13 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
           });
           if (!persistedExerciseId) {
             const exerciseLabel = String(ex?.title || ex?.name || `#${i + 1}`).trim();
-            return res.status(400).json({
-              error: `Invalid reference - related record not found (${exerciseLabel})`,
-              details: {
-                exerciseLabel,
-                requestedExerciseId: ex?.exerciseId || null,
-              }
-            });
+            const unresolvedReferenceError = new Error(`Invalid reference - related record not found (${exerciseLabel})`);
+            unresolvedReferenceError.statusCode = 400;
+            unresolvedReferenceError.details = {
+              exerciseLabel,
+              requestedExerciseId: ex?.exerciseId || null,
+            };
+            throw unresolvedReferenceError;
           }
 
           const insertColumns = [trainingExercisesFkColumn, 'exercise_id', 'sequence_order', 'duration_minutes', 'notes'];
