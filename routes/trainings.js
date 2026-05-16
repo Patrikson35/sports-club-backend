@@ -240,7 +240,7 @@ const isSafeIdentifier = (value) => /^[A-Za-z0-9_]+$/.test(String(value || ''));
 
 const quoteIdentifier = (value) => `\`${String(value)}\``;
 
-const resolveReferencedFallbackId = async (connection, tableName, columnName) => {
+const resolveForeignKeyReference = async (connection, tableName, columnName) => {
   const safeTableName = String(tableName || '').trim();
   const safeColumnName = String(columnName || '').trim();
   if (!safeTableName || !safeColumnName) return null;
@@ -258,9 +258,21 @@ const resolveReferencedFallbackId = async (connection, tableName, columnName) =>
 
   const referencedTableName = String(rows?.[0]?.referencedTableName || '').trim();
   const referencedColumnName = String(rows?.[0]?.referencedColumnName || '').trim();
-
   if (!referencedTableName || !referencedColumnName) return null;
+
   if (!isSafeIdentifier(referencedTableName) || !isSafeIdentifier(referencedColumnName)) return null;
+
+  return {
+    referencedTableName,
+    referencedColumnName,
+  };
+};
+
+const resolveReferencedFallbackId = async (connection, tableName, columnName) => {
+  const foreignKeyReference = await resolveForeignKeyReference(connection, tableName, columnName);
+  if (!foreignKeyReference) return null;
+
+  const { referencedTableName, referencedColumnName } = foreignKeyReference;
 
   const [refRows] = await connection.query(
     `SELECT ${quoteIdentifier(referencedColumnName)} AS ref_id
@@ -510,6 +522,107 @@ const createFallbackExerciseRecord = async (connection, exercisePayload, options
 
   const insertedId = Number(result?.insertId);
   return Number.isFinite(insertedId) && insertedId > 0 ? insertedId : null;
+};
+
+const normalizeTrainingSectionKey = (exercise) => {
+  const rawValue = String(
+    exercise?.section
+    || exercise?.section_id
+    || exercise?.sectionId
+    || 'main'
+  ).trim().toLowerCase();
+
+  if (['warmup', 'prep', 'preparation'].includes(rawValue)) return 'warmup';
+  if (['cooldown', 'cool', 'end', 'finish'].includes(rawValue)) return 'cooldown';
+  return 'main';
+};
+
+const resolveTrainingSectionOrderIndex = (sectionKey) => {
+  if (sectionKey === 'warmup') return 1;
+  if (sectionKey === 'main') return 2;
+  return 3;
+};
+
+const resolveTrainingSectionIdForExercise = async (connection, trainingId, exercise, cache = null) => {
+  const targetCache = cache && typeof cache === 'object'
+    ? cache
+    : { sectionIdByKey: new Map(), config: null };
+
+  if (!(targetCache.sectionIdByKey instanceof Map)) {
+    targetCache.sectionIdByKey = new Map();
+  }
+
+  const sectionKey = normalizeTrainingSectionKey(exercise);
+  if (targetCache.sectionIdByKey.has(sectionKey)) {
+    return targetCache.sectionIdByKey.get(sectionKey);
+  }
+
+  if (!targetCache.config) {
+    targetCache.config = {
+      idColumn: await resolveExistingColumn(connection, 'training_sections', ['id']),
+      trainingFkColumn: await resolveExistingColumn(connection, 'training_sections', ['training_id', 'training_session_id', 'session_id']),
+      sectionTypeColumn: await resolveExistingColumn(connection, 'training_sections', ['section_type', 'section', 'type', 'name']),
+      orderColumn: await resolveExistingColumn(connection, 'training_sections', ['order_index', 'sequence_order', 'position']),
+      durationColumn: await resolveExistingColumn(connection, 'training_sections', ['duration_minutes', 'duration']),
+    };
+  }
+
+  const { idColumn, trainingFkColumn, sectionTypeColumn, orderColumn, durationColumn } = targetCache.config;
+  if (!idColumn || !trainingFkColumn) return null;
+
+  let whereSql = `${quoteIdentifier(trainingFkColumn)} = ?`;
+  const whereParams = [trainingId];
+  if (sectionTypeColumn) {
+    whereSql += ` AND ${quoteIdentifier(sectionTypeColumn)} = ?`;
+    whereParams.push(sectionKey);
+  }
+
+  const [existingRows] = await connection.query(
+    `SELECT ${quoteIdentifier(idColumn)} AS id
+     FROM training_sections
+     WHERE ${whereSql}
+     ORDER BY ${quoteIdentifier(idColumn)} ASC
+     LIMIT 1`,
+    whereParams
+  );
+
+  const existingId = Number(existingRows?.[0]?.id);
+  if (Number.isFinite(existingId) && existingId > 0) {
+    targetCache.sectionIdByKey.set(sectionKey, Math.trunc(existingId));
+    return Math.trunc(existingId);
+  }
+
+  const insertColumns = [trainingFkColumn];
+  const insertValues = [trainingId];
+
+  if (sectionTypeColumn) {
+    insertColumns.push(sectionTypeColumn);
+    insertValues.push(sectionKey);
+  }
+
+  if (orderColumn) {
+    insertColumns.push(orderColumn);
+    insertValues.push(resolveTrainingSectionOrderIndex(sectionKey));
+  }
+
+  if (durationColumn) {
+    insertColumns.push(durationColumn);
+    insertValues.push(null);
+  }
+
+  const placeholders = insertColumns.map(() => '?').join(', ');
+  const insertColumnsSql = insertColumns.map((columnName) => quoteIdentifier(columnName)).join(', ');
+
+  const [insertResult] = await connection.query(
+    `INSERT INTO training_sections (${insertColumnsSql}) VALUES (${placeholders})`,
+    insertValues
+  );
+
+  const insertedId = Number(insertResult?.insertId);
+  if (!Number.isFinite(insertedId) || insertedId <= 0) return null;
+
+  targetCache.sectionIdByKey.set(sectionKey, Math.trunc(insertedId));
+  return Math.trunc(insertedId);
 };
 
 const resolveTrainingExerciseSectionValue = (exercise, sectionMeta) => {
@@ -1005,6 +1118,11 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
       const dateColumn = await resolveTrainingDateColumn(connection);
       const trainingExercisesFkColumn = await ensureTrainingExercisesSchema(connection);
       const trainingExercisesSectionMeta = await resolveTrainingExercisesSectionColumnMeta(connection);
+      const trainingExercisesSectionReference = trainingExercisesSectionMeta?.name
+        ? await resolveForeignKeyReference(connection, 'training_exercises', trainingExercisesSectionMeta.name)
+        : null;
+      const sectionUsesTrainingSections = String(trainingExercisesSectionReference?.referencedTableName || '').toLowerCase() === 'training_sections';
+      const trainingSectionResolverCache = { sectionIdByKey: new Map(), config: null };
       
       // Insert training session
       const [result] = await connection.query(`
@@ -1042,14 +1160,23 @@ router.post('/', authenticateToken, requireRole(['club', 'coach']), async (req, 
           const insertValues = [trainingId, persistedExerciseId, i + 1, ex.duration, ex.notes || null];
 
           if (trainingExercisesSectionMeta?.name) {
+            let resolvedSectionValue = null;
+            if (sectionUsesTrainingSections) {
+              resolvedSectionValue = await resolveTrainingSectionIdForExercise(connection, trainingId, ex, trainingSectionResolverCache);
+            }
+            if (!Number.isFinite(Number(resolvedSectionValue)) || Number(resolvedSectionValue) <= 0) {
+              resolvedSectionValue = resolveTrainingExerciseSectionValue(ex, trainingExercisesSectionMeta);
+            }
+
             insertColumns.push(trainingExercisesSectionMeta.name);
-            insertValues.push(resolveTrainingExerciseSectionValue(ex, trainingExercisesSectionMeta));
+            insertValues.push(resolvedSectionValue);
           }
 
           const placeholders = insertColumns.map(() => '?').join(', ');
+          const insertColumnsSql = insertColumns.map((columnName) => quoteIdentifier(columnName)).join(', ');
           await connection.query(`
             INSERT INTO training_exercises 
-            (${insertColumns.join(', ')})
+            (${insertColumnsSql})
             VALUES (${placeholders})
           `, insertValues);
         }
