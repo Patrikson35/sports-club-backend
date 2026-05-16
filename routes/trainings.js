@@ -1043,8 +1043,10 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     const attendanceTrainingColumn = await resolveAttendanceTrainingColumn(db);
     const attendanceMinutesColumn = await resolveAttendanceMinutesColumn(db);
 
-    const [attendance] = attendanceTrainingColumn
-      ? await db.query(`
+    let attendance = [];
+    if (attendanceTrainingColumn) {
+      try {
+        const [attendanceRows] = await db.query(`
           SELECT 
             ar.id,
             ar.status,
@@ -1060,8 +1062,12 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
           LEFT JOIN team_memberships tm ON ar.user_id = tm.user_id
           WHERE ar.${quoteIdentifier(attendanceTrainingColumn)} = ?
           ORDER BY tm.jersey_number
-        `, [trainingId])
-      : [[]];
+        `, [trainingId]);
+        attendance = Array.isArray(attendanceRows) ? attendanceRows : [];
+      } catch {
+        attendance = [];
+      }
+    }
     
     res.json({
       id: training.id,
