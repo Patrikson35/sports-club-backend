@@ -156,6 +156,34 @@ const resolveTrainingExercisesForeignKeyColumn = async (connection = db) => (
   ])
 );
 
+const resolveTrainingExercisesForeignKeyColumns = async (connection = db) => {
+  try {
+    const [columns] = await connection.query('SHOW COLUMNS FROM training_exercises');
+    const available = new Set((Array.isArray(columns) ? columns : []).map((column) => String(column?.Field || '').toLowerCase()));
+    const preferredOrder = ['training_session_id', 'training_id', 'session_id', 'trainingId'];
+    return preferredOrder.filter((column) => available.has(String(column).toLowerCase()));
+  } catch (error) {
+    if (error?.code === 'ER_NO_SUCH_TABLE') return [];
+    throw error;
+  }
+};
+
+const buildTrainingExerciseReferenceSql = (columns, trainingId, tableAlias = 'te') => {
+  const normalizedColumns = Array.isArray(columns)
+    ? columns.filter((column) => String(column || '').trim())
+    : [];
+
+  if (!normalizedColumns.length) {
+    return { sql: '1 = 0', params: [] };
+  }
+
+  const conditions = normalizedColumns.map((column) => `${tableAlias}.${quoteIdentifier(column)} = ?`);
+  return {
+    sql: conditions.map((condition) => `(${condition})`).join(' OR '),
+    params: normalizedColumns.map(() => trainingId),
+  };
+};
+
 const resolveTrainingExercisesSectionColumn = async (connection = db) => (
   resolveExistingColumn(connection, 'training_exercises', [
     'section_id',
@@ -702,7 +730,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
     const { teamId, status, limit = 50 } = req.query;
     await ensureTrainingSessionScheduleColumns(db);
     const dateColumn = await resolveTrainingDateColumn(db);
-    const trainingExercisesFkColumn = await resolveTrainingExercisesForeignKeyColumn(db);
+    const trainingExercisesFkColumns = await resolveTrainingExercisesForeignKeyColumns(db);
     const scopedTeamIds = await getScopedTeamIds(db, req.user);
 
     if (Array.isArray(scopedTeamIds) && scopedTeamIds.length === 0) {
@@ -723,18 +751,17 @@ router.get('/', authenticateToken, async (req, res, next) => {
         ts.location,
         ts.status,
         ts.description,
-        ${trainingExercisesFkColumn ? 'COALESCE(tec.exercise_count, 0)' : '0'} AS exercise_count,
+        ${trainingExercisesFkColumns.length > 0
+    ? `(
+            SELECT COUNT(*)
+            FROM training_exercises tec
+            WHERE ${trainingExercisesFkColumns.map((column) => `tec.${quoteIdentifier(column)} = ts.id`).join(' OR ')}
+          )`
+    : '0'} AS exercise_count,
         t.name as team_name,
         t.age_group
       FROM training_sessions ts
       LEFT JOIN teams t ON ts.team_id = t.id
-      ${trainingExercisesFkColumn
-    ? `LEFT JOIN (
-        SELECT ${trainingExercisesFkColumn} AS training_ref_id, COUNT(*) AS exercise_count
-        FROM training_exercises
-        GROUP BY ${trainingExercisesFkColumn}
-      ) tec ON tec.training_ref_id = ts.id`
-    : ''}
       WHERE 1=1
     `;
     
@@ -805,7 +832,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     const trainingId = Number(req.params.id);
     await ensureTrainingSessionScheduleColumns(db);
     const dateColumn = await resolveTrainingDateColumn(db);
-    const trainingExercisesFkColumn = await resolveTrainingExercisesForeignKeyColumn(db);
+    const trainingExercisesFkColumns = await resolveTrainingExercisesForeignKeyColumns(db);
     const access = await ensureTrainingAccess(db, req.user, trainingId);
     if (access.notFound) {
       return res.status(404).json({ error: 'Training not found' });
@@ -835,7 +862,9 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     // Get exercises
     const exerciseNameColumn = await resolveExercisesNameColumn(db);
 
-    const [exercises] = trainingExercisesFkColumn
+    const exerciseReference = buildTrainingExerciseReferenceSql(trainingExercisesFkColumns, trainingId, 'te');
+
+    const [exercises] = trainingExercisesFkColumns.length > 0
       ? await db.query(`
           SELECT 
             te.id,
@@ -849,9 +878,9 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
           FROM training_exercises te
           JOIN exercises e ON te.exercise_id = e.id
           LEFT JOIN exercise_categories ec ON e.category_id = ec.id
-          WHERE te.${trainingExercisesFkColumn} = ?
+          WHERE ${exerciseReference.sql}
           ORDER BY te.sequence_order
-        `, [trainingId])
+        `, exerciseReference.params)
       : [[]];
     
     // Get attendance
@@ -1214,7 +1243,7 @@ router.delete('/:id', authenticateToken, requireRole(['club', 'coach']), async (
 router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
   try {
     const trainingId = Number(req.params.id);
-    const trainingExercisesFkColumn = await resolveTrainingExercisesForeignKeyColumn(db);
+    const trainingExercisesFkColumns = await resolveTrainingExercisesForeignKeyColumns(db);
     const access = await ensureTrainingAccess(db, req.user, trainingId);
     if (access.notFound) {
       return res.status(404).json({ error: 'Training not found' });
@@ -1225,7 +1254,9 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
 
     const exerciseNameColumn = await resolveExercisesNameColumn(db);
 
-    const [exercises] = trainingExercisesFkColumn
+    const exerciseReference = buildTrainingExerciseReferenceSql(trainingExercisesFkColumns, trainingId, 'te');
+
+    const [exercises] = trainingExercisesFkColumns.length > 0
       ? await db.query(`
           SELECT 
             te.id,
@@ -1241,9 +1272,9 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
           FROM training_exercises te
           JOIN exercises e ON te.exercise_id = e.id
           LEFT JOIN exercise_categories ec ON e.category_id = ec.id
-          WHERE te.${trainingExercisesFkColumn} = ?
+          WHERE ${exerciseReference.sql}
           ORDER BY te.sequence_order
-        `, [trainingId])
+        `, exerciseReference.params)
       : [[]];
     
     res.json({
