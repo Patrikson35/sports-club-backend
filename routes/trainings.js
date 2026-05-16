@@ -875,12 +875,13 @@ const ensureTrainingAccess = async (connection, reqUser, trainingId) => {
 // GET /api/trainings - Get all training sessions
 router.get('/', authenticateToken, async (req, res, next) => {
   try {
-    const { teamId, status, limit = 50, excludeHidden, exclude_hidden } = req.query;
+    const { teamId, status, limit = 50, excludeHidden, exclude_hidden, requireExercises, require_exercises } = req.query;
     await ensureTrainingSessionScheduleColumns(db);
     const dateColumn = await resolveTrainingDateColumn(db);
     const trainingExercisesFkColumns = await resolveTrainingExercisesForeignKeyColumns(db);
     const scopedTeamIds = await getScopedTeamIds(db, req.user);
     const shouldExcludeHidden = ['1', 'true', 'yes'].includes(String(excludeHidden ?? exclude_hidden ?? '').trim().toLowerCase());
+    const shouldRequireExercises = ['1', 'true', 'yes'].includes(String(requireExercises ?? require_exercises ?? '').trim().toLowerCase());
 
     if (Array.isArray(scopedTeamIds) && scopedTeamIds.length === 0) {
       return res.json({ total: 0, trainings: [] });
@@ -889,6 +890,14 @@ router.get('/', authenticateToken, async (req, res, next) => {
     // Map legacy status value 'scheduled' to 'planned'
     const dbStatus = status === 'scheduled' ? 'planned' : status;
     
+    const exerciseCountSql = trainingExercisesFkColumns.length > 0
+      ? `(
+            SELECT COUNT(*)
+            FROM training_exercises tec
+            WHERE ${trainingExercisesFkColumns.map((column) => `tec.${quoteIdentifier(column)} = ts.id`).join(' OR ')}
+          )`
+      : '0';
+
     let query = `
       SELECT 
         ts.id,
@@ -900,13 +909,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
         ts.location,
         ts.status,
         ts.description,
-        ${trainingExercisesFkColumns.length > 0
-    ? `(
-            SELECT COUNT(*)
-            FROM training_exercises tec
-            WHERE ${trainingExercisesFkColumns.map((column) => `tec.${quoteIdentifier(column)} = ts.id`).join(' OR ')}
-          )`
-    : '0'} AS exercise_count,
+        ${exerciseCountSql} AS exercise_count,
         t.name as team_name,
         t.age_group
       FROM training_sessions ts
@@ -938,6 +941,10 @@ router.get('/', authenticateToken, async (req, res, next) => {
     if (shouldExcludeHidden) {
       query += ' AND (ts.description IS NULL OR ts.description NOT LIKE ?)';
       params.push(`%${TRAININGS_HIDDEN_MARKER}%`);
+    }
+
+    if (shouldRequireExercises) {
+      query += ` AND ${exerciseCountSql} > 0`;
     }
     
     query += ` ORDER BY ts.${dateColumn} DESC, ts.start_time DESC LIMIT ?`;
