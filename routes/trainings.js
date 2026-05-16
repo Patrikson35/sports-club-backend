@@ -4,6 +4,7 @@ const db = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 
 const PLANNER_META_MARKER = '[[PLANNER_META]]';
+const TRAININGS_HIDDEN_MARKER = '[[TRAININGS_HIDDEN]]';
 
 const parsePlannerMetaInput = (recurrenceRule, sessionType, indicatorCode) => {
   let recurrence = {};
@@ -840,11 +841,12 @@ const ensureTrainingAccess = async (connection, reqUser, trainingId) => {
 // GET /api/trainings - Get all training sessions
 router.get('/', authenticateToken, async (req, res, next) => {
   try {
-    const { teamId, status, limit = 50 } = req.query;
+    const { teamId, status, limit = 50, excludeHidden, exclude_hidden } = req.query;
     await ensureTrainingSessionScheduleColumns(db);
     const dateColumn = await resolveTrainingDateColumn(db);
     const trainingExercisesFkColumns = await resolveTrainingExercisesForeignKeyColumns(db);
     const scopedTeamIds = await getScopedTeamIds(db, req.user);
+    const shouldExcludeHidden = ['1', 'true', 'yes'].includes(String(excludeHidden ?? exclude_hidden ?? '').trim().toLowerCase());
 
     if (Array.isArray(scopedTeamIds) && scopedTeamIds.length === 0) {
       return res.json({ total: 0, trainings: [] });
@@ -897,6 +899,11 @@ router.get('/', authenticateToken, async (req, res, next) => {
     if (dbStatus) {
       query += ' AND ts.status = ?';
       params.push(dbStatus);
+    }
+
+    if (shouldExcludeHidden) {
+      query += ' AND (ts.description IS NULL OR ts.description NOT LIKE ?)';
+      params.push(`%${TRAININGS_HIDDEN_MARKER}%`);
     }
     
     query += ` ORDER BY ts.${dateColumn} DESC, ts.start_time DESC LIMIT ?`;
@@ -1314,7 +1321,7 @@ router.put('/:id', authenticateToken, requireRole(['club', 'coach']), async (req
   }
 });
 
-// DELETE /api/trainings/:id - Delete training session
+// DELETE /api/trainings/:id - Hide training in trainings module, keep planner/evidence data
 router.delete('/:id', authenticateToken, requireRole(['club', 'coach']), async (req, res, next) => {
   try {
     const trainingId = Number(req.params.id);
@@ -1326,27 +1333,28 @@ router.delete('/:id', authenticateToken, requireRole(['club', 'coach']), async (
     try {
       await connection.beginTransaction();
 
-      const trainingExercisesColumn = await resolveExistingColumn(connection, 'training_exercises', [
-        'training_session_id',
-        'training_id',
-        'session_id',
-        'trainingId',
-      ]);
-      if (trainingExercisesColumn) {
-        await connection.query(`DELETE FROM training_exercises WHERE ${trainingExercisesColumn} = ?`, [trainingId]);
+      const [rows] = await connection.query(
+        'SELECT description FROM training_sessions WHERE id = ? LIMIT 1',
+        [trainingId]
+      );
+
+      if (!Array.isArray(rows) || rows.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({ error: 'Training not found' });
       }
 
-      const attendanceColumn = await resolveExistingColumn(connection, 'attendance', [
-        'training_session_id',
-        'training_id',
-        'session_id',
-        'trainingId',
-      ]);
-      if (attendanceColumn) {
-        await connection.query(`DELETE FROM attendance WHERE ${attendanceColumn} = ?`, [trainingId]);
-      }
+      const currentDescription = String(rows[0]?.description || '');
+      const alreadyHidden = currentDescription.includes(TRAININGS_HIDDEN_MARKER);
+      const nextDescription = alreadyHidden
+        ? currentDescription
+        : (currentDescription.trim()
+          ? `${currentDescription}\n${TRAININGS_HIDDEN_MARKER}`
+          : TRAININGS_HIDDEN_MARKER);
 
-      const [result] = await connection.query('DELETE FROM training_sessions WHERE id = ?', [trainingId]);
+      const [result] = await connection.query(
+        'UPDATE training_sessions SET description = ? WHERE id = ?',
+        [nextDescription, trainingId]
+      );
 
       if (!result?.affectedRows) {
         await connection.rollback();
@@ -1354,7 +1362,7 @@ router.delete('/:id', authenticateToken, requireRole(['club', 'coach']), async (
       }
 
       await connection.commit();
-      res.json({ id: trainingId, message: 'Training session deleted successfully' });
+      res.json({ id: trainingId, message: 'Training session hidden from trainings list' });
     } catch (error) {
       await connection.rollback();
       throw error;
