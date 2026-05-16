@@ -221,6 +221,22 @@ const resolveExercisesNameColumn = async (connection = db) => (
   ])
 );
 
+const resolveExercisesDifficultyColumn = async (connection = db) => (
+  resolveExistingColumn(connection, 'exercises', [
+    'difficulty_level',
+    'difficulty',
+    'level',
+  ])
+);
+
+const resolveExercisesEquipmentColumn = async (connection = db) => (
+  resolveExistingColumn(connection, 'exercises', [
+    'required_equipment',
+    'equipment_needed',
+    'equipment',
+  ])
+);
+
 const resolveTeamClubId = async (connection, teamId) => {
   const parsedTeamId = Number(teamId);
   if (!Number.isFinite(parsedTeamId) || parsedTeamId <= 0) return null;
@@ -981,6 +997,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     
     // Get exercises
     const exerciseNameColumn = await resolveExercisesNameColumn(db);
+    const exerciseDifficultyColumn = await resolveExercisesDifficultyColumn(db);
 
     const exerciseReference = buildTrainingExerciseReferenceSql(trainingExercisesFkColumns, trainingId, 'te');
 
@@ -991,9 +1008,10 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
             te.sequence_order,
             te.duration_minutes,
             te.notes,
+            e.id AS exercise_id,
             ${exerciseNameColumn ? `e.${exerciseNameColumn} AS exercise_name` : 'NULL AS exercise_name'},
             e.description,
-            e.difficulty_level,
+            ${exerciseDifficultyColumn ? `e.${exerciseDifficultyColumn} AS exercise_difficulty` : 'NULL AS exercise_difficulty'},
             ec.name as category_name
           FROM training_exercises te
           JOIN exercises e ON te.exercise_id = e.id
@@ -1051,7 +1069,7 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
         name: ex.exercise_name,
         description: ex.description,
         category: ex.category_name,
-        difficulty: ex.difficulty_level,
+        difficulty: ex.exercise_difficulty,
         duration: ex.duration_minutes,
         order: ex.sequence_order,
         notes: ex.notes
@@ -1388,6 +1406,8 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
     }
 
     const exerciseNameColumn = await resolveExercisesNameColumn(db);
+    const exerciseDifficultyColumn = await resolveExercisesDifficultyColumn(db);
+    const exerciseEquipmentColumn = await resolveExercisesEquipmentColumn(db);
 
     const exerciseReference = buildTrainingExerciseReferenceSql(trainingExercisesFkColumns, trainingId, 'te');
 
@@ -1401,8 +1421,8 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
             e.id as exercise_id,
             ${exerciseNameColumn ? `e.${exerciseNameColumn} AS exercise_name` : 'NULL AS exercise_name'},
             e.description,
-            e.difficulty_level,
-            e.required_equipment,
+            ${exerciseDifficultyColumn ? `e.${exerciseDifficultyColumn} AS exercise_difficulty` : 'NULL AS exercise_difficulty'},
+            ${exerciseEquipmentColumn ? `e.${exerciseEquipmentColumn} AS exercise_equipment` : 'NULL AS exercise_equipment'},
             ec.name as category_name
           FROM training_exercises te
           JOIN exercises e ON te.exercise_id = e.id
@@ -1420,8 +1440,8 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
         name: ex.exercise_name,
         description: ex.description,
         category: ex.category_name,
-        difficulty: ex.difficulty_level,
-        equipment: ex.required_equipment,
+        difficulty: ex.exercise_difficulty,
+        equipment: ex.exercise_equipment,
         duration: ex.duration_minutes,
         order: ex.sequence_order,
         notes: ex.notes
