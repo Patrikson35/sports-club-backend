@@ -237,6 +237,24 @@ const resolveExercisesEquipmentColumn = async (connection = db) => (
   ])
 );
 
+const resolveAttendanceTrainingColumn = async (connection = db) => (
+  resolveExistingColumn(connection, 'attendance', [
+    'training_id',
+    'training_session_id',
+    'session_id',
+    'trainingId',
+  ])
+);
+
+const resolveAttendanceMinutesColumn = async (connection = db) => (
+  resolveExistingColumn(connection, 'attendance', [
+    'minutes_participated',
+    'minutes_present',
+    'minutes',
+    'duration_minutes',
+  ])
+);
+
 const resolveTeamClubId = async (connection, teamId) => {
   const parsedTeamId = Number(teamId);
   if (!Number.isFinite(parsedTeamId) || parsedTeamId <= 0) return null;
@@ -1022,23 +1040,28 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
       : [[]];
     
     // Get attendance
-    const [attendance] = await db.query(`
-      SELECT 
-        ar.id,
-        ar.status,
-        ar.minutes_participated as minutes_present,
-        ar.notes,
-        u.id as player_id,
-        tm.jersey_number,
-        u.first_name,
-        u.last_name,
-        u.avatar_url
-      FROM attendance ar
-      JOIN users u ON ar.user_id = u.id
-      LEFT JOIN team_memberships tm ON ar.user_id = tm.user_id
-      WHERE ar.training_id = ?
-      ORDER BY tm.jersey_number
-    `, [trainingId]);
+    const attendanceTrainingColumn = await resolveAttendanceTrainingColumn(db);
+    const attendanceMinutesColumn = await resolveAttendanceMinutesColumn(db);
+
+    const [attendance] = attendanceTrainingColumn
+      ? await db.query(`
+          SELECT 
+            ar.id,
+            ar.status,
+            ${attendanceMinutesColumn ? `ar.${quoteIdentifier(attendanceMinutesColumn)} as minutes_present` : 'NULL as minutes_present'},
+            ar.notes,
+            u.id as player_id,
+            tm.jersey_number,
+            u.first_name,
+            u.last_name,
+            u.avatar_url
+          FROM attendance ar
+          JOIN users u ON ar.user_id = u.id
+          LEFT JOIN team_memberships tm ON ar.user_id = tm.user_id
+          WHERE ar.${quoteIdentifier(attendanceTrainingColumn)} = ?
+          ORDER BY tm.jersey_number
+        `, [trainingId])
+      : [[]];
     
     res.json({
       id: training.id,
