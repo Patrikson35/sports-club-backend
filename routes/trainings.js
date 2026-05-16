@@ -169,19 +169,41 @@ const resolveTrainingExercisesForeignKeyColumns = async (connection = db) => {
   }
 };
 
-const buildTrainingExerciseReferenceSql = (columns, trainingId, tableAlias = 'te') => {
+const buildTrainingExerciseReferenceSql = (columns, trainingId, tableAlias = 'te', options = {}) => {
   const normalizedColumns = Array.isArray(columns)
     ? columns.filter((column) => String(column || '').trim())
     : [];
 
-  if (!normalizedColumns.length) {
+  const sectionColumn = String(options?.sectionColumn || '').trim();
+  const trainingSectionsTrainingColumn = String(options?.trainingSectionsTrainingColumn || '').trim();
+
+  const conditions = [];
+  const params = [];
+
+  normalizedColumns.forEach((column) => {
+    conditions.push(`${tableAlias}.${quoteIdentifier(column)} = ?`);
+    params.push(trainingId);
+  });
+
+  if (sectionColumn && trainingSectionsTrainingColumn) {
+    conditions.push(
+      `EXISTS (
+         SELECT 1
+         FROM training_sections tsec
+         WHERE tsec.${quoteIdentifier('id')} = ${tableAlias}.${quoteIdentifier(sectionColumn)}
+           AND tsec.${quoteIdentifier(trainingSectionsTrainingColumn)} = ?
+       )`
+    );
+    params.push(trainingId);
+  }
+
+  if (!conditions.length) {
     return { sql: '1 = 0', params: [] };
   }
 
-  const conditions = normalizedColumns.map((column) => `${tableAlias}.${quoteIdentifier(column)} = ?`);
   return {
     sql: conditions.map((condition) => `(${condition})`).join(' OR '),
-    params: normalizedColumns.map(() => trainingId),
+    params,
   };
 };
 
@@ -192,6 +214,46 @@ const resolveTrainingExercisesSectionColumn = async (connection = db) => (
     'sectionId',
   ])
 );
+
+const resolveTrainingSectionsTrainingColumn = async (connection = db) => (
+  resolveExistingColumn(connection, 'training_sections', [
+    'training_id',
+    'training_session_id',
+    'session_id',
+    'trainingId',
+  ])
+);
+
+const buildTrainingExerciseCountSql = (trainingAlias, directColumns = [], options = {}) => {
+  const alias = String(trainingAlias || 'ts').trim() || 'ts';
+  const normalizedColumns = Array.isArray(directColumns)
+    ? directColumns.filter((column) => String(column || '').trim())
+    : [];
+
+  const sectionColumn = String(options?.sectionColumn || '').trim();
+  const trainingSectionsTrainingColumn = String(options?.trainingSectionsTrainingColumn || '').trim();
+
+  const conditions = normalizedColumns.map((column) => `tec.${quoteIdentifier(column)} = ${alias}.${quoteIdentifier('id')}`);
+
+  if (sectionColumn && trainingSectionsTrainingColumn) {
+    conditions.push(
+      `EXISTS (
+         SELECT 1
+         FROM training_sections tsec
+         WHERE tsec.${quoteIdentifier('id')} = tec.${quoteIdentifier(sectionColumn)}
+           AND tsec.${quoteIdentifier(trainingSectionsTrainingColumn)} = ${alias}.${quoteIdentifier('id')}
+       )`
+    );
+  }
+
+  if (!conditions.length) return '0';
+
+  return `(
+    SELECT COUNT(DISTINCT tec.${quoteIdentifier('id')})
+    FROM training_exercises tec
+    WHERE ${conditions.join(' OR ')}
+  )`;
+};
 
 const resolveTrainingExercisesSectionColumnMeta = async (connection = db) => {
   const sectionColumn = await resolveTrainingExercisesSectionColumn(connection);
@@ -879,6 +941,8 @@ router.get('/', authenticateToken, async (req, res, next) => {
     await ensureTrainingSessionScheduleColumns(db);
     const dateColumn = await resolveTrainingDateColumn(db);
     const trainingExercisesFkColumns = await resolveTrainingExercisesForeignKeyColumns(db);
+    const trainingExercisesSectionColumn = await resolveTrainingExercisesSectionColumn(db);
+    const trainingSectionsTrainingColumn = await resolveTrainingSectionsTrainingColumn(db);
     const scopedTeamIds = await getScopedTeamIds(db, req.user);
     const shouldExcludeHidden = ['1', 'true', 'yes'].includes(String(excludeHidden ?? exclude_hidden ?? '').trim().toLowerCase());
     const shouldRequireExercises = ['1', 'true', 'yes'].includes(String(requireExercises ?? require_exercises ?? '').trim().toLowerCase());
@@ -890,13 +954,10 @@ router.get('/', authenticateToken, async (req, res, next) => {
     // Map legacy status value 'scheduled' to 'planned'
     const dbStatus = status === 'scheduled' ? 'planned' : status;
     
-    const exerciseCountSql = trainingExercisesFkColumns.length > 0
-      ? `(
-            SELECT COUNT(*)
-            FROM training_exercises tec
-            WHERE ${trainingExercisesFkColumns.map((column) => `tec.${quoteIdentifier(column)} = ts.id`).join(' OR ')}
-          )`
-      : '0';
+    const exerciseCountSql = buildTrainingExerciseCountSql('ts', trainingExercisesFkColumns, {
+      sectionColumn: trainingExercisesSectionColumn,
+      trainingSectionsTrainingColumn,
+    });
 
     let query = `
       SELECT 
@@ -994,6 +1055,8 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     await ensureTrainingSessionScheduleColumns(db);
     const dateColumn = await resolveTrainingDateColumn(db);
     const trainingExercisesFkColumns = await resolveTrainingExercisesForeignKeyColumns(db);
+    const trainingExercisesSectionColumn = await resolveTrainingExercisesSectionColumn(db);
+    const trainingSectionsTrainingColumn = await resolveTrainingSectionsTrainingColumn(db);
     const access = await ensureTrainingAccess(db, req.user, trainingId);
     if (access.notFound) {
       return res.status(404).json({ error: 'Training not found' });
@@ -1024,7 +1087,10 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
     const exerciseNameColumn = await resolveExercisesNameColumn(db);
     const exerciseDifficultyColumn = await resolveExercisesDifficultyColumn(db);
 
-    const exerciseReference = buildTrainingExerciseReferenceSql(trainingExercisesFkColumns, trainingId, 'te');
+    const exerciseReference = buildTrainingExerciseReferenceSql(trainingExercisesFkColumns, trainingId, 'te', {
+      sectionColumn: trainingExercisesSectionColumn,
+      trainingSectionsTrainingColumn,
+    });
 
     const [exercises] = trainingExercisesFkColumns.length > 0
       ? await db.query(`
@@ -1433,6 +1499,8 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
   try {
     const trainingId = Number(req.params.id);
     const trainingExercisesFkColumns = await resolveTrainingExercisesForeignKeyColumns(db);
+    const trainingExercisesSectionColumn = await resolveTrainingExercisesSectionColumn(db);
+    const trainingSectionsTrainingColumn = await resolveTrainingSectionsTrainingColumn(db);
     const access = await ensureTrainingAccess(db, req.user, trainingId);
     if (access.notFound) {
       return res.status(404).json({ error: 'Training not found' });
@@ -1445,7 +1513,10 @@ router.get('/:id/exercises', authenticateToken, async (req, res, next) => {
     const exerciseDifficultyColumn = await resolveExercisesDifficultyColumn(db);
     const exerciseEquipmentColumn = await resolveExercisesEquipmentColumn(db);
 
-    const exerciseReference = buildTrainingExerciseReferenceSql(trainingExercisesFkColumns, trainingId, 'te');
+    const exerciseReference = buildTrainingExerciseReferenceSql(trainingExercisesFkColumns, trainingId, 'te', {
+      sectionColumn: trainingExercisesSectionColumn,
+      trainingSectionsTrainingColumn,
+    });
 
     const [exercises] = trainingExercisesFkColumns.length > 0
       ? await db.query(`
