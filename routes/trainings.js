@@ -5,6 +5,14 @@ const { authenticateToken, requireRole } = require('../middleware/auth');
 
 const PLANNER_META_MARKER = '[[PLANNER_META]]';
 const TRAININGS_HIDDEN_MARKER = '[[TRAININGS_HIDDEN]]';
+const TRAININGS_ROUTE_FINGERPRINT = 'trainings-route-dc76dd8-v2';
+
+const buildTrainingsDebugMeta = () => ({
+  service: 'api-simple',
+  routeFingerprint: TRAININGS_ROUTE_FINGERPRINT,
+  commit: String(process.env.RAILWAY_GIT_COMMIT_SHA || process.env.SOURCE_VERSION || process.env.VERCEL_GIT_COMMIT_SHA || '').trim() || null,
+  timestamp: new Date().toISOString(),
+});
 
 const parsePlannerMetaInput = (recurrenceRule, sessionType, indicatorCode) => {
   let recurrence = {};
@@ -1015,6 +1023,7 @@ router.get('/', authenticateToken, async (req, res, next) => {
     
     res.json({
       total: trainings.length,
+      debug: buildTrainingsDebugMeta(),
       trainings: trainings.map(tr => ({
         ...(() => {
           const meta = extractPlannerMetaFromDescription(tr.description);
